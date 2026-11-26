@@ -4,12 +4,14 @@ import json
 import os
 import random
 import re
+import ssl
 import time
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.redis import RedisStorage
@@ -415,6 +417,251 @@ async def safe_edit_menu(chat_id: int, message_id: int | None, text: str, kb: In
             pass
     msg = await bot.send_message(chat_id, text, reply_markup=kb, disable_web_page_preview=True)
     return msg.message_id
+
+
+# --- ПРОФИЛИ ИГРОКОВ NOOMINORA: «АККАУНТ» И «ЧЕКНУТЬ <ID>» ---
+# Команды работают и в ЛС, и в группах для любых пользователей бота.
+# Обработчики зарегистрированы ДО catch-all (private_stranger / group_auto_reply),
+# поэтому имеют приоритет над автоответами.
+
+GAMESERVER_API = os.getenv("GAMESERVER_API", "https://85.192.20.22:13882").rstrip("/")
+GAME_API_SECRET = os.getenv(
+    "GAME_API_SECRET", "ZYs8n0qHGIm24VpFeYfdGu7uuEcOXslqDHca3vxVBs8"
+).strip()
+TG_LINK_TTL = 60 * 60 * 24 * 30  # кэш связки account_id -> tg_id, 30 дней
+
+try:
+    from profile_card import render_error_card, render_profile_card
+
+    PROFILE_RENDER_OK = True
+except Exception as _profile_import_err:  # Pillow или шрифт недоступны
+    PROFILE_RENDER_OK = False
+    print(f"Карточки профилей недоступны: {_profile_import_err}")
+
+_game_ssl = ssl.create_default_context()
+_game_ssl.check_hostname = False
+_game_ssl.verify_mode = ssl.CERT_NONE  # у игрового сервера самоподписанный сертификат
+_game_session: aiohttp.ClientSession | None = None
+
+_profile_cooldown: dict[int, float] = {}
+
+_PROFILE_OWN_CMDS = {"аккаунт", "/аккаунт", "/account", "!аккаунт", ".аккаунт"}
+_CHECK_RE = re.compile(r"^[/!.]?чекнуть(?:\s+(\d{1,12}))?\s*$", re.IGNORECASE)
+_CHECK_EN_RE = re.compile(r"^[/!.]?check(?:\s+(\d{1,12}))?\s*$", re.IGNORECASE)
+
+
+def _game_http() -> aiohttp.ClientSession:
+    global _game_session
+    if _game_session is None or _game_session.closed:
+        _game_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=20),
+            connector=aiohttp.TCPConnector(ssl=_game_ssl),
+        )
+    return _game_session
+
+
+async def game_api_get(path: str, bot_secret: bool = False):
+    """GET к игровому API. Возвращает (status, json|None). Ошибки сети — (0, None)."""
+    headers = {"X-Bot-Secret": GAME_API_SECRET} if bot_secret else {}
+    try:
+        async with _game_http().get(f"{GAMESERVER_API}{path}", headers=headers) as resp:
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                data = None
+            return resp.status, data
+    except Exception as e:
+        print(f"Game API error {path}: {e}")
+        return 0, None
+
+
+async def _avatar_bytes(tg_id: int) -> bytes | None:
+    """Аватарка пользователя Telegram (самый большой размер)."""
+    try:
+        photos = await bot.get_user_profile_photos(tg_id, limit=1)
+        if not photos.total or not photos.photos:
+            return None
+        src = await bot.download(photos.photos[0][-1].file_id)
+        if src is None:
+            return None
+        return src.read()
+    except Exception as e:
+        print(f"Не удалось получить аватар {tg_id}: {e}")
+        return None
+
+
+async def _avatar_for_account(account_id: int) -> bytes | None:
+    """Аватар чужого профиля — из кэша связок account_id -> tg_id."""
+    try:
+        cached = await redis_client.get(f"bot:tglink:{account_id}")
+    except Exception:
+        cached = None
+    if cached:
+        return await _avatar_bytes(int(cached))
+    return None
+
+
+def _profile_cooldown_ok(user_id: int) -> bool:
+    now = time.time()
+    if now - _profile_cooldown.get(user_id, 0) < 4:
+        return False
+    _profile_cooldown[user_id] = now
+    if len(_profile_cooldown) > 5000:
+        _profile_cooldown.clear()
+    return True
+
+
+def _parse_profile_command(message: Message):
+    """('own', None) | ('check', id) | ('hint', None) | None, если это не команда."""
+    text = (message.text or "").strip()
+    if not text or len(text) > 64:
+        return None
+    low = text.casefold()
+    if low in _PROFILE_OWN_CMDS:
+        return ("own", None)
+    m = _CHECK_RE.match(low) or _CHECK_EN_RE.match(low)
+    if m:
+        return ("check", int(m.group(1)) if m.group(1) else None)
+    return None
+
+
+async def _send_card_png(message: Message, png: bytes):
+    photo = BufferedInputFile(png, filename="profile.png")
+    if message.chat.type in ("group", "supergroup"):
+        await message.reply_photo(photo)  # в чате видно, чей профиль чекнули
+    else:
+        await message.answer_photo(photo)  # без текста, всё на картинке
+
+
+def _send_render_fallback(message: Message):
+    try:
+        asyncio.get_running_loop().create_task(
+            message.answer("Карточки профилей временно недоступны, попробуй позже.")
+        )
+    except Exception:
+        pass
+
+
+async def _finish_profile_card(message: Message, player: dict, avatar: bytes | None, tag: str):
+    if not PROFILE_RENDER_OK:
+        _send_render_fallback(message)
+        return
+    png = await asyncio.to_thread(render_profile_card, player, avatar)
+    await _send_card_png(message, png)
+
+
+async def _finish_error_card(message: Message, title: str, subtitle: str = "", tag: str = ""):
+    if not PROFILE_RENDER_OK:
+        _send_render_fallback(message)
+        return
+    png = await asyncio.to_thread(render_error_card, title, subtitle, tag)
+    await _send_card_png(message, png)
+
+
+async def profile_flow_own(message: Message):
+    """«Аккаунт» — свой профиль по привязанному Telegram."""
+    tag = "АККАУНТ"
+    tg_id = message.from_user.id if message.from_user else 0
+    if not tg_id:
+        return
+
+    status, acc = await game_api_get(f"/bot/account?tg_id={tg_id}", bot_secret=True)
+    if status == 404:
+        await _finish_error_card(
+            message,
+            "АККАУНТ НЕ ПРИВЯЗАН",
+            "Привяжи игру в боте @noominora_bot и попробуй снова",
+            tag,
+        )
+        return
+    if status != 200 or not isinstance(acc, dict) or not acc.get("account_id"):
+        await _finish_error_card(message, "СЕРВЕР ИГРЫ НЕ ОТВЕЧАЕТ", "Попробуй чуть позже", tag)
+        return
+
+    account_id = int(acc["account_id"])
+    try:
+        await redis_client.set(f"bot:tglink:{account_id}", str(tg_id), ex=TG_LINK_TTL)
+    except Exception:
+        pass
+
+    if acc.get("banned"):
+        await _finish_error_card(message, "АККАУНТ ЗАБАНЕН", "Профиль недоступен", tag)
+        return
+
+    status2, player = await game_api_get(f"/players/{account_id}")
+    if status2 == 404:
+        await _finish_error_card(message, "ИГРОК НЕ НАЙДЕН", "Аккаунт удалён из игры", tag)
+        return
+    if status2 == 403:
+        await _finish_error_card(
+            message,
+            "ПРОФИЛЬ СКРЫТ",
+            "В игре включена приватность профиля — открой её в настройках",
+            tag,
+        )
+        return
+    if status2 != 200 or not isinstance(player, dict):
+        await _finish_error_card(message, "СЕРВЕР ИГРЫ НЕ ОТВЕЧАЕТ", "Попробуй чуть позже", tag)
+        return
+
+    avatar = await _avatar_bytes(tg_id)
+    await _finish_profile_card(message, player, avatar, tag)
+
+
+async def profile_flow_check(message: Message, target_id: int):
+    """«Чекнуть <id>» — чужой профиль по ID в игре."""
+    tag = f"ЧЕКНУТЬ {target_id}"
+
+    status, player = await game_api_get(f"/players/{target_id}")
+    if status == 404:
+        await _finish_error_card(
+            message, "ИГРОК НЕ НАЙДЕН", f"Проверь ID: чекнуть {target_id}", tag
+        )
+        return
+    if status == 403:
+        await _finish_error_card(
+            message, "ПРОФИЛЬ ЗАКРЫТ", "Владелец скрыл этот профиль настройками приватности", tag
+        )
+        return
+    if status != 200 or not isinstance(player, dict):
+        await _finish_error_card(message, "СЕРВЕР ИГРЫ НЕ ОТВЕЧАЕТ", "Попробуй чуть позже", tag)
+        return
+
+    avatar = await _avatar_for_account(target_id)
+    await _finish_profile_card(message, player, avatar, tag)
+
+
+@router.message(
+    F.chat.type.in_({"private", "group", "supergroup"}),
+    F.text,
+    StateFilter(None),  # не мешаем FSM-меню (шагам добавления триггеров)
+)
+async def profile_commands(message: Message):
+    if message.from_user and message.from_user.is_bot:
+        return
+    parsed = _parse_profile_command(message)
+    if not parsed:
+        return
+    kind, target = parsed
+
+    if kind == "own":
+        if not _profile_cooldown_ok(message.from_user.id):
+            return
+        await profile_flow_own(message)
+        return
+
+    # «Чекнуть»
+    if not message.from_user or not _profile_cooldown_ok(message.from_user.id):
+        return
+    if target is None:
+        await _finish_error_card(
+            message,
+            "УКАЖИ ID ИГРОКА",
+            "Отправь: Чекнуть 90000 — ID виден в профиле игрока",
+            "ЧЕКНУТЬ",
+        )
+        return
+    await profile_flow_check(message, target)
 
 
 @router.message(F.chat.type == "private", F.from_user.id != ADMIN_ID)
@@ -4718,6 +4965,8 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
+        if _game_session is not None and not _game_session.closed:
+            await _game_session.close()
         await bot.session.close()
         await redis_client.aclose()
 

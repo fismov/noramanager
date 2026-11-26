@@ -221,15 +221,15 @@ def render_profile_card(player: dict, avatar_bytes: bytes | None = None) -> byte
             avatar_bytes = None
 
     if not avatar_bytes:
-        # Стеклянный круг с первой буквой ника
+        # Тёмная заглушка с первой буквой ника
         draw.ellipse([av_x, av_y, av_x + av_box, av_y + av_box],
-                     fill=(255, 255, 255, 14), outline=(255, 255, 255, 46), width=3)
+                     fill=(34, 40, 37), outline=(65, 76, 70), width=3)
         letter = name[:1].upper()
         draw.text((cx, cy), letter, font=_load_font(112, 600), fill=INK, anchor="mm")
 
     # Кольцо вокруг аватара
     draw.ellipse([av_x - 9, av_y - 9, av_x + av_box + 9, av_y + av_box + 9],
-                 outline=(255, 255, 255, 56), width=3)
+                 outline=(65, 76, 70), width=3)
 
     # Премиум
     premium = bool(player.get("premium"))
@@ -337,6 +337,44 @@ def render_error_card(title: str, subtitle: str = "", tag: str = "") -> bytes:
                            fill=(245, 243, 238, 70))
 
     _grain(img)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+def render_premium_card(title: str, account_id: int, enable: bool, success: bool) -> bytes:
+    """Карточка результата операции с премиумом, 16:9."""
+    size = (1280, 720)
+    accent = (GREEN if enable else VIOLET) if success else SOFT
+    x, y = 995, 360
+    img = Image.new("RGBA", size, BG + (255,))
+    img.alpha_composite(_radial_blob(900, GREEN, 0.16), (-380, -510))
+    img.alpha_composite(_radial_blob(730, accent, 0.20), (x - 365, y - 365))
+
+    draw = ImageDraw.Draw(img)
+    draw.rounded_rectangle((32, 32, 1247, 687), radius=30, outline=(44, 47, 44), width=2)
+    _tracked(draw, (88, 148), "NOOMINORA · ПРЕМИУМ", _load_font(23, 500), SOFT, tracking=5)
+
+    title_font = _fit_font(draw, title, 700, 62, 650)
+    draw.text((88, 350), title, font=title_font, fill=INK, anchor="lm")
+    _pill(draw, 88, 469, f"ИГРОВОЙ ID  #{account_id}", _load_font(23, 500), INK,
+          (23, 25, 24), outline=(64, 67, 64), pad_x=24)
+
+    # Контурный знак рисуется линиями и не зависит от шрифта или эмодзи.
+    for radius, color in ((180, (46, 49, 47)), (143, (64, 67, 64))):
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color, width=2)
+    diamond = [(x, y - 100), (x + 100, y), (x, y + 100), (x - 100, y), (x, y - 100)]
+    draw.polygon(diamond[:-1], fill=(19, 21, 20))
+    draw.line(diamond, fill=accent, width=5, joint="curve")
+    if success:
+        draw.rounded_rectangle((x - 37, y - 4, x + 37, y + 4), radius=4, fill=accent)
+        if enable:
+            draw.rounded_rectangle((x - 4, y - 37, x + 4, y + 37), radius=4, fill=accent)
+    else:
+        draw.rounded_rectangle((x - 4, y - 32, x + 4, y + 10), radius=4, fill=accent)
+        draw.ellipse((x - 5, y + 23, x + 5, y + 33), fill=accent)
+
+    _grain(img, 0.08)
     buf = io.BytesIO()
     img.convert("RGB").save(buf, "PNG", optimize=True)
     return buf.getvalue()

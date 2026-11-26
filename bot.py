@@ -2,7 +2,9 @@ import asyncio
 import html
 import json
 import os
+import random
 import re
+import time
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -30,6 +32,24 @@ WEB_PORT = int(os.getenv("PORT", "8080"))
 
 STRANGER_REPLY = "Скачать игру можно тут:\n@noominora_bot"
 DB_HASH_KEY = "bot:triggers"
+
+# --- АВТООТВЕТЫ: ОТДЕЛЬНЫЕ КЛЮЧИ REDIS (старые данные bot:triggers не трогаем) ---
+MEDIA_REPLIES_KEY = "bot:media_replies"
+CHANNEL_REPLY_KEY = "bot:channel_reply"
+SETTINGS_KEY = "bot:settings"
+STATS_KEY = "bot:stats"
+LAST_REPLY_PREFIX = "bot:last_reply"
+
+AUTO_MEDIA_TYPES = ("sticker", "photo", "video", "voice", "animation", "video_note", "audio")
+AUTO_MEDIA_TITLES = {
+    "sticker": "Стикеры",
+    "photo": "Фото",
+    "video": "Видео",
+    "voice": "Голосовые (ГС)",
+    "animation": "Гифки",
+    "video_note": "Видео-кружки",
+    "audio": "Аудио",
+}
 
 VALID_MATCH_TYPES = ("exact", "contains", "regex")
 MATCH_TYPE_LABELS = {
@@ -307,6 +327,8 @@ def extract_media_info(message: Message) -> tuple[str, str | None]:
         return "voice", message.voice.file_id
     if message.video_note:
         return "video_note", message.video_note.file_id
+    if message.audio:
+        return "audio", message.audio.file_id
     return "text", None
 
 
@@ -332,6 +354,8 @@ async def send_trigger_reply(chat_id: int, item: dict, reply_to_message_id: int 
         await bot.send_voice(chat_id, file_id, caption=text or None, reply_markup=kb, **kwargs)
     elif m_type == "video_note" and file_id:
         await bot.send_video_note(chat_id, file_id, reply_markup=kb, **kwargs)
+    elif m_type == "audio" and file_id:
+        await bot.send_audio(chat_id, file_id, caption=text or None, reply_markup=kb, **kwargs)
     else:
         await bot.send_message(
             chat_id,
@@ -370,7 +394,8 @@ async def main_menu_text() -> str:
         f"Активных фраз в базе: <b>{summary['total']}</b>\n"
         f"Точные: <b>{summary['exact']}</b> · Содержит: <b>{summary['contains']}</b> · Regex: <b>{summary['regex']}</b>\n"
         f"{web_line}"
-        "Хранилище: <b>Upstash Redis</b>\n\n"
+        "Хранилище: <b>Upstash Redis</b>\n"
+        "Реакции на медиа и посты канала настраиваются в веб-панели.\n\n"
         "Выберите действие ниже:"
     )
 
@@ -724,25 +749,337 @@ async def cb_del(call: CallbackQuery):
     )
 
 
+# --- АВТООТВЕТЫ: МЕДИА-РЕАКЦИИ И ПОСТЫ КАНАЛА ---
+
+
+def normalize_auto_answer(raw: object) -> dict:
+    """Приводит вариант автоответа к единому виду, ничего не теряя."""
+    if not isinstance(raw, dict):
+        return {"media_type": "text", "file_id": None, "html_text": "", "buttons": []}
+    buttons = clean_buttons(raw.get("buttons") or [])
+    media_type = str(raw.get("media_type") or "text")
+    file_id = raw.get("file_id") or None
+    if media_type != "text" and not file_id:
+        media_type = "text"
+    return {
+        "media_type": media_type,
+        "file_id": file_id,
+        "html_text": str(raw.get("html_text") or ""),
+        "buttons": buttons,
+    }
+
+
+def _parse_chance(value: object, default: int) -> int:
+    try:
+        chance = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(100, max(0, chance))
+
+
+def normalize_media_config(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
+    answers_raw = raw.get("answers")
+    answers = (
+        [normalize_auto_answer(a) for a in answers_raw]
+        if isinstance(answers_raw, list)
+        else []
+    )
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "chance": _parse_chance(raw.get("chance", 50), 50),
+        "answers": answers,
+    }
+
+
+def default_media_config() -> dict:
+    return {"enabled": True, "chance": 50, "answers": []}
+
+
+async def get_media_config(media_type: str) -> dict:
+    raw = await redis_client.hget(MEDIA_REPLIES_KEY, media_type)
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return normalize_media_config(data)
+        except Exception:
+            pass
+    return default_media_config()
+
+
+async def save_media_config(media_type: str, config: dict) -> None:
+    await redis_client.hset(
+        MEDIA_REPLIES_KEY,
+        media_type,
+        json.dumps(normalize_media_config(config), ensure_ascii=False),
+    )
+
+
+async def get_all_media_configs() -> dict:
+    raw = await redis_client.hgetall(MEDIA_REPLIES_KEY)
+    result = {}
+    for media_type in AUTO_MEDIA_TYPES:
+        value = raw.get(media_type)
+        config = None
+        if value:
+            try:
+                data = json.loads(value)
+                if isinstance(data, dict):
+                    config = normalize_media_config(data)
+            except Exception:
+                config = None
+        result[media_type] = config or default_media_config()
+    return result
+
+
+def normalize_channel_config(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
+    answers_raw = raw.get("answers")
+    answers = (
+        [normalize_auto_answer(a) for a in answers_raw]
+        if isinstance(answers_raw, list)
+        else []
+    )
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "chance": _parse_chance(raw.get("chance", 100), 100),
+        "in_groups": bool(raw.get("in_groups", True)),
+        "in_channels": bool(raw.get("in_channels", False)),
+        "answers": answers,
+    }
+
+
+async def get_channel_config() -> dict:
+    raw = await redis_client.get(CHANNEL_REPLY_KEY)
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return normalize_channel_config(data)
+        except Exception:
+            pass
+    return normalize_channel_config(None)
+
+
+async def save_channel_config(config: dict) -> None:
+    await redis_client.set(
+        CHANNEL_REPLY_KEY,
+        json.dumps(normalize_channel_config(config), ensure_ascii=False),
+    )
+
+
+def normalize_settings(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def clamp(value: object, default: int, lo: int, hi: int) -> int:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return default
+        return min(hi, max(lo, value))
+
+    return {
+        "ignore_bots": bool(raw.get("ignore_bots", True)),
+        "cooldown": clamp(raw.get("cooldown", 0), 0, 0, 3600),
+        "delay_min": clamp(raw.get("delay_min", 0), 0, 0, 120),
+        "delay_max": clamp(raw.get("delay_max", 0), 0, 0, 120),
+    }
+
+
+async def get_settings() -> dict:
+    raw = await redis_client.get(SETTINGS_KEY)
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return normalize_settings(data)
+        except Exception:
+            pass
+    return normalize_settings(None)
+
+
+async def save_settings_db(config: dict) -> None:
+    await redis_client.set(
+        SETTINGS_KEY,
+        json.dumps(normalize_settings(config), ensure_ascii=False),
+    )
+
+
+async def bump_stat(kind: str) -> None:
+    try:
+        await redis_client.hincrby(STATS_KEY, kind, 1)
+    except Exception:
+        pass
+
+
+async def get_stats() -> dict:
+    raw = await redis_client.hgetall(STATS_KEY)
+
+    def num(key: str) -> int:
+        try:
+            return int(raw.get(key, 0))
+        except (TypeError, ValueError):
+            return 0
+
+    return {"triggers": num("triggers"), "media": num("media"), "channel": num("channel")}
+
+
+async def reset_stats_db() -> None:
+    await redis_client.delete(STATS_KEY)
+
+
+async def cooldown_ok(chat_id: int, cooldown_seconds: int) -> bool:
+    """Не даём боту отвечать слишком часто в одном чате."""
+    if cooldown_seconds <= 0:
+        return True
+    key = f"{LAST_REPLY_PREFIX}:{chat_id}"
+    last = await redis_client.get(key)
+    if last:
+        try:
+            if time.time() - float(last) < cooldown_seconds:
+                return False
+        except (TypeError, ValueError):
+            pass
+    await redis_client.set(key, str(time.time()), ex=max(cooldown_seconds * 2, 60))
+    return True
+
+
+def is_channel_post(message: Message) -> bool:
+    """True, если сообщение опубликовано от имени канала (пост ТГК в группе)."""
+    sender = message.sender_chat
+    if sender is None:
+        return False
+    if getattr(message, "is_automatic_forward", None) or getattr(message, "automatic_forward", None):
+        return True
+    return sender.type == "channel"
+
+
+def pick_random_answer(config: dict) -> dict | None:
+    answers = [
+        a
+        for a in (config.get("answers") or [])
+        if a.get("file_id") or (a.get("html_text") or "").strip() or a.get("buttons")
+    ]
+    if not answers:
+        return None
+    return random.choice(answers)
+
+
+def roll_chance(chance: int) -> bool:
+    return random.randint(1, 100) <= chance
+
+
+async def maybe_media_reply(message: Message, settings: dict):
+    """Случайная реакция на стикер, фото, видео, ГС и другой медиа."""
+    media_type, _ = extract_media_info(message)
+    if media_type == "text":
+        return
+    config = await get_media_config(media_type)
+    if not config["enabled"] or not config["answers"]:
+        return
+    if not roll_chance(config["chance"]):
+        return
+    if not await cooldown_ok(message.chat.id, settings["cooldown"]):
+        return
+    answer = pick_random_answer(config)
+    if not answer:
+        return
+    low = min(settings["delay_min"], settings["delay_max"])
+    high = max(settings["delay_min"], settings["delay_max"])
+    if high > 0:
+        await asyncio.sleep(random.uniform(low, high))
+    try:
+        await send_trigger_reply(message.chat.id, answer, reply_to_message_id=message.message_id)
+        await bump_stat("media")
+    except Exception as e:
+        print(f"Ошибка медиа-реакции: {e}")
+
+
+async def handle_channel_post(message: Message, settings: dict | None = None):
+    """Ответ на пост от Telegram-канала: в группе или в самом канале."""
+    settings = settings or await get_settings()
+    config = await get_channel_config()
+    if not config["enabled"] or not config["answers"]:
+        return
+    if message.chat.type in ("group", "supergroup"):
+        if not config["in_groups"]:
+            return
+    elif message.chat.type == "channel":
+        if not config["in_channels"]:
+            return
+    else:
+        return
+    if not roll_chance(config["chance"]):
+        return
+    if not await cooldown_ok(message.chat.id, settings["cooldown"]):
+        return
+    answer = pick_random_answer(config)
+    if not answer:
+        return
+    try:
+        await send_trigger_reply(message.chat.id, answer, reply_to_message_id=message.message_id)
+        await bump_stat("channel")
+    except Exception as e:
+        print(f"Ошибка ответа на пост канала: {e}")
+
+
+@router.message(F.chat.type == "channel")
+async def channel_chat_post(message: Message):
+    """Посты в самом канале (если бот — админ канала)."""
+    await handle_channel_post(message)
+
+
 # --- ОТВЕТЫ В ГРУППАХ ---
 
 
 @router.message(F.chat.type.in_({"group", "supergroup"}))
 async def group_auto_reply(message: Message):
+    settings = await get_settings()
+
+    # Не отвечаем другим ботам — защита от бесконечных петель
+    if settings["ignore_bots"] and message.from_user and message.from_user.is_bot:
+        return
+
+    # Пост от Telegram-канала: триггеры приоритетнее, иначе — автоответ канала
+    if is_channel_post(message):
+        incoming = message.text or message.caption
+        if incoming:
+            db = await get_all_triggers()
+            found = find_matching_trigger(incoming, db)
+            if found:
+                _, item = found
+                try:
+                    await send_trigger_reply(
+                        message.chat.id, item, reply_to_message_id=message.message_id
+                    )
+                    await bump_stat("triggers")
+                except Exception as e:
+                    print(f"Ошибка при отправке ответа в чат: {e}")
+                return
+        await handle_channel_post(message, settings)
+        return
+
     incoming = message.text or message.caption
-    if not incoming:
-        return
+    if incoming:
+        db = await get_all_triggers()
+        found = find_matching_trigger(incoming, db)
+        if found:
+            _, item = found
+            try:
+                await send_trigger_reply(
+                    message.chat.id, item, reply_to_message_id=message.message_id
+                )
+                await bump_stat("triggers")
+            except Exception as e:
+                print(f"Ошибка при отправке ответа в чат: {e}")
+            return
 
-    db = await get_all_triggers()
-    found = find_matching_trigger(incoming, db)
-    if not found:
-        return
-
-    _, item = found
-    try:
-        await send_trigger_reply(message.chat.id, item, reply_to_message_id=message.message_id)
-    except Exception as e:
-        print(f"Ошибка при отправке ответа в чат: {e}")
+    # Триггер не сработал — пробуем случайную реакцию на медиа
+    await maybe_media_reply(message, settings)
 
 
 # --- ВЕБ-ИНТЕРФЕЙС (МИНИМАЛИЗМ: ЧЁРНЫЙ ФОН, БЕЛЫЕ КНОПКИ, UNBOUNDED, LUCIDE ICONS) ---
@@ -2098,6 +2435,130 @@ WEB_HTML = r"""<!DOCTYPE html>
   ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 99px; }
   ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
 
+  /* ============ AUTO REPLIES ============ */
+  input[type="number"] {
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    outline: none;
+    background: rgba(0, 0, 0, 0.24);
+    color: var(--ink);
+    padding: 10px 11px;
+    font-size: 10.5px;
+    transition: border-color 0.16s, background 0.16s;
+  }
+
+  input[type="number"]:focus { border-color: var(--line-strong); background: rgba(0, 0, 0, 0.34); }
+  input[type="number"]::placeholder { color: var(--dim); }
+
+  .switch { position: relative; display: inline-flex; width: 34px; height: 20px; flex: 0 0 34px; cursor: pointer; }
+
+  .switch input { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; margin: 0; cursor: pointer; }
+
+  .switch i {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border-radius: 99px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid var(--line);
+    transition: 0.18s;
+  }
+
+  .switch i::after {
+    content: "";
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--muted);
+    transition: 0.18s;
+  }
+
+  .switch input:checked + i { background: rgba(154, 230, 164, 0.22); border-color: rgba(154, 230, 164, 0.35); }
+  .switch input:checked + i::after { left: 17px; background: var(--green); }
+
+  .chance-row { display: flex; align-items: center; gap: 10px; margin: 11px 0 13px; }
+  .chance-row input[type="range"] { flex: 1; accent-color: var(--ink); cursor: pointer; }
+
+  .chance-val {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    min-width: 48px;
+    text-align: center;
+    color: var(--ink-soft);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 6px 8px;
+    background: rgba(0, 0, 0, 0.2);
+  }
+
+  .variant-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 9px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: rgba(0, 0, 0, 0.16);
+    margin-bottom: 7px;
+  }
+
+  .variant-row__body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+
+  .variant-row__text {
+    font-size: 9.5px;
+    color: var(--ink-soft);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .variant-row__meta {
+    font-size: 7.5px;
+    color: var(--dim);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .variant-row .icon-btn { width: 27px; height: 27px; flex: 0 0 27px; border-radius: 8px; }
+  .variant-row .icon-btn svg { width: 12px; height: 12px; }
+
+  .variants-empty {
+    padding: 10px 12px;
+    border: 1px dashed var(--line);
+    border-radius: 12px;
+    font-size: 8.5px;
+    color: var(--dim);
+    text-align: center;
+    margin-bottom: 7px;
+  }
+
+  .auto-section { display: flex; flex-direction: column; }
+
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 9px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.055);
+  }
+
+  .toggle-row__label { display: flex; flex-direction: column; gap: 2px; }
+  .toggle-row__label b { font-size: 9.5px; font-weight: 500; color: var(--ink-soft); }
+  .toggle-row__label span { font-size: 7.5px; color: var(--muted); }
+
+  .num-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+  .num-cell { display: flex; flex-direction: column; gap: 6px; }
+  .num-cell span { font-size: 7.5px; color: var(--muted); letter-spacing: 0.06em; text-transform: uppercase; }
+  .num-cell input { text-align: center; font-family: var(--font-mono); }
+
   /* ============ ANIMATIONS ============ */
   @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 
@@ -2232,6 +2693,11 @@ WEB_HTML = r"""<!DOCTYPE html>
         <span>Заготовки</span>
         <span class="nav__badge" id="nav_total_2">0</span>
       </button>
+      <button class="nav__link" type="button" data-view="auto">
+        <i data-lucide="zap"></i>
+        <span>Автоответы</span>
+        <span class="nav__badge" id="nav_auto">0</span>
+      </button>
 
       <span class="nav__group">Действия</span>
       <button class="nav__link" type="button" onclick="openEditor()">
@@ -2361,6 +2827,8 @@ WEB_HTML = r"""<!DOCTYPE html>
             <div class="stat-row"><span>Фраз в базе</span><b id="stat_phrases">0</b></div>
             <div class="stat-row"><span>С медиафайлом</span><b id="stat_media">0</b></div>
             <div class="stat-row"><span>Кнопок</span><b id="stat_buttons">0</b></div>
+            <div class="stat-row"><span>Медиа-реакций</span><b id="stat_auto_media">0</b></div>
+            <div class="stat-row"><span>Ответов на посты канала</span><b id="stat_auto_channel">0</b></div>
             <div class="stat-row"><span>Подключение</span><span class="ok"><i></i> Online</span></div>
           </div>
           <button class="btn btn--glass btn--sm btn--block" type="button" style="margin-top:14px;" onclick="exportBackup()">
@@ -2415,6 +2883,58 @@ WEB_HTML = r"""<!DOCTYPE html>
           </button>
         </div>
       </section>
+    </section>
+
+    <!-- АВТООТВЕТЫ -->
+    <section class="view" data-view="auto">
+      <div class="page-head">
+        <div>
+          <span class="eyebrow">Auto replies</span>
+          <h1>Автоответы</h1>
+          <p>Случайные реакции на стикеры, фото, видео и голосовые, а также мгновенные ответы на посты канала. Для каждого типа — свой шанс срабатывания и список вариантов, из которых бот выбирает случайный.</p>
+        </div>
+        <div class="page-head__actions">
+          <button class="btn btn--glass btn--sm" type="button" onclick="loadAuto(true)">
+            <i data-lucide="refresh-cw"></i>
+            <span>Обновить</span>
+          </button>
+        </div>
+      </div>
+
+      <section class="panel glass">
+        <div class="panel__head">
+          <div>
+            <div class="panel__title">Реакции на медиа</div>
+            <div class="panel__sub">Если в чате появляется стикер, фото, видео или ГС — бот с заданной вероятностью отвечает случайным вариантом</div>
+          </div>
+          <span class="pill pill--contains"><i></i> Random</span>
+        </div>
+        <div class="project-grid" id="media_grid"></div>
+      </section>
+
+      <div class="grid-2">
+        <section class="panel glass">
+          <div class="panel__head">
+            <div>
+              <div class="panel__title">Посты канала</div>
+              <div class="panel__sub">Бот первым отвечает на пост, опубликованный от имени канала</div>
+            </div>
+            <span class="pill pill--regex"><i></i> ТГК</span>
+          </div>
+          <div id="channel_panel"></div>
+        </section>
+
+        <section class="panel glass">
+          <div class="panel__head">
+            <div>
+              <div class="panel__title">Поведение и защита</div>
+              <div class="panel__sub">Чтобы бот не спамил и не зацикливался с другими ботами</div>
+            </div>
+            <span class="pill"><i></i> Shield</span>
+          </div>
+          <div id="settings_panel"></div>
+        </section>
+      </div>
     </section>
   </div>
 </div>
@@ -2532,6 +3052,70 @@ WEB_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
+<!-- РЕДАКТОР ВАРИАНТА АВТООТВЕТА -->
+<div class="modal" id="answer_modal" aria-hidden="true">
+  <div class="modal__backdrop" onclick="closeAnswerEditor()"></div>
+  <div class="modal__card glass" role="dialog" aria-modal="true" aria-labelledby="answer_title" style="max-width:760px;">
+    <div class="modal__head">
+      <div>
+        <span class="eyebrow" id="answer_eyebrow">Auto answer</span>
+        <h2 id="answer_title">Вариант ответа</h2>
+      </div>
+      <button class="icon-btn" type="button" onclick="closeAnswerEditor()" aria-label="Закрыть">
+        <i data-lucide="x"></i>
+      </button>
+    </div>
+
+    <div class="modal__body">
+      <label class="field">
+        <span class="field__label">Текст ответа (HTML)</span>
+        <div class="toolbar">
+          <button type="button" class="tool-btn" onclick="wrapTag('b', 'answer_text')" title="Жирный"><i data-lucide="bold"></i> B</button>
+          <button type="button" class="tool-btn" onclick="wrapTag('i', 'answer_text')" title="Курсив"><i data-lucide="italic"></i> I</button>
+          <button type="button" class="tool-btn" onclick="wrapTag('u', 'answer_text')" title="Подчёркнутый"><i data-lucide="underline"></i> U</button>
+          <button type="button" class="tool-btn" onclick="wrapTag('code', 'answer_text')" title="Код"><i data-lucide="code"></i> Code</button>
+          <button type="button" class="tool-btn" onclick="insertLink('answer_text')" title="Ссылка"><i data-lucide="link"></i> Ссылка</button>
+        </div>
+        <textarea id="answer_text" placeholder="Введите текст ответа..." style="min-height:96px;"></textarea>
+        <span class="field__hint">Оставьте пустым, если вариант должен отправлять только медиа или только кнопки.</span>
+      </label>
+
+      <div class="field">
+        <span class="field__label">Медиафайл (необязательно)</span>
+        <div class="dropzone" id="answer_dropzone">
+          <i data-lucide="upload-cloud"></i>
+          <b id="answer_file_name">Файл не выбран</b>
+          <span>фото, видео, гиф, аудио или документ · до 50 МБ</span>
+          <input type="file" id="answer_file" onchange="onAnswerFileChange()">
+        </div>
+        <div class="media-existing" id="answer_media_note" hidden>
+          <span><i data-lucide="paperclip"></i> В варианте: <b id="answer_media_label"></b></span>
+          <button type="button" onclick="removeAnswerMedia()">Убрать</button>
+        </div>
+        <input type="hidden" id="answer_media_type" value="text">
+        <input type="hidden" id="answer_file_id" value="">
+      </div>
+
+      <div class="field" style="margin-bottom:0;">
+        <span class="field__label">Кнопки под сообщением</span>
+        <div id="answer_buttons_box"></div>
+        <button type="button" class="btn btn--glass btn--sm add-btn-row" onclick="addAnswerBtnRow()">
+          <i data-lucide="plus"></i>
+          <span>Добавить кнопку</span>
+        </button>
+      </div>
+    </div>
+
+    <div class="modal__foot">
+      <button class="btn btn--glass" type="button" onclick="closeAnswerEditor()">Отмена</button>
+      <button class="btn btn--light" type="button" id="answer_save_btn" onclick="saveAnswer()">
+        <span>Сохранить вариант</span>
+        <i data-lucide="check"></i>
+      </button>
+    </div>
+  </div>
+</div>
+
 <div id="toast">
   <i data-lucide="check-circle-2"></i>
   <span id="toast_text">Готово</span>
@@ -2548,6 +3132,22 @@ let editingOriginal = '';
 let existingMediaType = 'text';
 let existingFileId = '';
 let toastTimer = null;
+let autoData = { media: {}, channel: {}, settings: {}, stats: {} };
+let editingScope = '';
+let editingIndex = -1;
+let answerMediaType = 'text';
+let answerFileId = '';
+
+const AUTO_MEDIA_TYPES = ['sticker', 'photo', 'video', 'voice', 'animation', 'video_note', 'audio'];
+const AUTO_MEDIA_TITLES = {
+  sticker: 'Стикеры',
+  photo: 'Фото',
+  video: 'Видео',
+  voice: 'Голосовые (ГС)',
+  animation: 'Гифки',
+  video_note: 'Видео-кружки',
+  audio: 'Аудио'
+};
 
 const TYPE_ORDER = ['exact', 'contains', 'regex'];
 const TYPE_META = {
@@ -2613,7 +3213,8 @@ const ICONS = {
   'strikethrough': '<path d="M16 4H9a3 3 0 0 0-2.8 4"/><path d="M14 12a4 4 0 0 1 0 8H6"/><path d="M4 12h16"/>',
   'underline': '<path d="M6 4v6a6 6 0 0 0 12 0V4"/><path d="M4 20h16"/>',
   'upload-cloud': '<path d="M16 16l-4-4-4 4"/><path d="M12 12v9"/><path d="M20.4 18.4A5 5 0 0 0 18 9h-1.3A8 8 0 1 0 4 17.3"/>',
-  'trash-2': '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/>'
+  'trash-2': '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/>',
+  'zap': '<path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/>'
 };
 
 function iconSvg(name) {
@@ -2695,6 +3296,7 @@ async function login() {
   const btn = document.getElementById('login_btn');
   btn.disabled = true;
   const ok = await loadTriggers(true);
+  if (ok) await loadAuto(true);
   btn.disabled = false;
   if (ok) {
     localStorage.setItem('tg_admin_pass', authPass);
@@ -3050,8 +3652,8 @@ function removeExistingMedia() {
   showToast('Медиа будет удалено после сохранения');
 }
 
-function wrapTag(tag) {
-  const ta = document.getElementById('html_text');
+function wrapTag(tag, targetId) {
+  const ta = document.getElementById(targetId || 'html_text');
   const start = ta.selectionStart;
   const end = ta.selectionEnd;
   const selected = ta.value.substring(start, end) || 'текст';
@@ -3060,11 +3662,11 @@ function wrapTag(tag) {
   updatePreview();
 }
 
-function insertLink() {
+function insertLink(targetId) {
   const url = prompt('Ссылка (https://... или @username):', 'https://t.me/noominora_bot');
   if (!url) return;
   const cleanUrl = url.startsWith('@') ? 'https://t.me/' + url.slice(1) : url;
-  const ta = document.getElementById('html_text');
+  const ta = document.getElementById(targetId || 'html_text');
   const start = ta.selectionStart;
   const end = ta.selectionEnd;
   const selected = ta.value.substring(start, end) || 'Скачать';
@@ -3246,8 +3848,401 @@ async function exportBackup() {
   }
 }
 
+// ===== АВТООТВЕТЫ =====
+
+async function loadAuto(silent) {
+  try {
+    const res = await apiFetch('/api/auto');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    autoData = await res.json();
+    if (!autoData.media) autoData.media = {};
+    renderAuto();
+    renderAutoStats();
+    return true;
+  } catch (e) {
+    if (!silent) showToast('Не удалось загрузить автоответы', true);
+    return false;
+  }
+}
+
+function scopeConfig(scope) {
+  if (scope === 'channel') return autoData.channel || {};
+  return (autoData.media && autoData.media[scope]) || {};
+}
+
+function answersTotal() {
+  let total = (autoData.channel && autoData.channel.answers ? autoData.channel.answers.length : 0);
+  Object.values(autoData.media || {}).forEach(cfg => {
+    total += (cfg.answers || []).length;
+  });
+  return total;
+}
+
+function renderAutoStats() {
+  const stats = autoData.stats || {};
+  const set = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+  };
+  set('stat_auto_media', stats.media || 0);
+  set('stat_auto_channel', stats.channel || 0);
+}
+
+function renderAuto() {
+  const grid = document.getElementById('media_grid');
+  grid.innerHTML = AUTO_MEDIA_TYPES.map(t => autoCardHtml(t, scopeConfig(t))).join('');
+  bindAutoCardActions(grid);
+
+  const badge = document.getElementById('nav_auto');
+  if (badge) badge.textContent = answersTotal();
+
+  renderChannelPanel();
+  renderSettingsPanel();
+  renderAutoStats();
+  refreshIcons();
+}
+
+function variantRowHtml(scope, index, answer) {
+  const media = answer.file_id && (answer.media_type || 'text') !== 'text';
+  const btns = (answer.buttons || []).reduce((s, r) => s + r.length, 0);
+  const meta = [];
+  if (media) meta.push(mediaLabel(answer.media_type));
+  if (btns) meta.push(btns + ' кноп.');
+  const text = plainText(answer.html_text) || (media ? 'Медиа без текста' : 'Без содержимого');
+  return '<div class="variant-row">' +
+    '<div class="variant-row__body">' +
+      '<span class="variant-row__text">' + escapeHtml(text) + '</span>' +
+      (meta.length ? '<span class="variant-row__meta">' + meta.map(m => escapeHtml(m)).join(' · ') + '</span>' : '') +
+    '</div>' +
+    '<button class="icon-btn" type="button" data-edit-answer="' + scope + ':' + index + '" title="Изменить"><i data-lucide="pencil"></i></button>' +
+    '<button class="icon-btn icon-btn--danger" type="button" data-del-answer="' + scope + ':' + index + '" title="Удалить"><i data-lucide="trash-2"></i></button>' +
+  '</div>';
+}
+
+function autoCardHtml(type, cfg) {
+  const answers = cfg.answers || [];
+  const variants = answers.length
+    ? answers.map((a, i) => variantRowHtml(type, i, a)).join('')
+    : '<div class="variants-empty">Вариантов пока нет — добавьте первый ответ.</div>';
+  return '<article class="trigger glass" style="min-height:0;">' +
+    '<div class="trigger__top">' +
+      '<div class="trigger__badges"><span class="pill pill--contains">' + AUTO_MEDIA_TITLES[type] + '</span></div>' +
+      '<label class="switch" title="Включить / выключить"><input type="checkbox" data-toggle="' + type + '"' + (cfg.enabled ? ' checked' : '') + '><i></i></label>' +
+    '</div>' +
+    '<div class="chance-row">' +
+      '<input type="range" min="0" max="100" step="5" value="' + (cfg.chance || 0) + '" data-chance="' + type + '" onchange="onChanceChange(this)">' +
+      '<span class="chance-val" data-chance-val="' + type + '">' + (cfg.chance || 0) + '%</span>' +
+    '</div>' +
+    '<div class="auto-section" style="margin-bottom:10px;">' + variants + '</div>' +
+    '<button class="btn btn--glass btn--sm btn--block" type="button" style="border-style:dashed;" onclick="openAnswerEditor(\'' + type + '\', -1)">' +
+      '<i data-lucide="plus"></i><span>Добавить вариант</span>' +
+    '</button>' +
+  '</article>';
+}
+
+function bindAutoCardActions(root) {
+  root.querySelectorAll('[data-toggle]').forEach(el => {
+    el.addEventListener('change', () => saveScopeConfig(el.dataset.toggle, { enabled: el.checked }));
+  });
+  root.querySelectorAll('[data-edit-answer]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const parts = btn.dataset.editAnswer.split(':');
+      openAnswerEditor(parts[0], parseInt(parts[1], 10));
+    });
+  });
+  root.querySelectorAll('[data-del-answer]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const parts = btn.dataset.delAnswer.split(':');
+      deleteAnswer(parts[0], parseInt(parts[1], 10));
+    });
+  });
+}
+
+function onChanceChange(el) {
+  const scope = el.dataset.chance;
+  const val = parseInt(el.value, 10);
+  const label = document.querySelector('[data-chance-val="' + scope + '"]');
+  if (label) label.textContent = val + '%';
+  saveScopeConfig(scope, { chance: val });
+}
+
+async function saveScopeConfig(scope, patch) {
+  try {
+    const res = await apiFetch('/api/auto/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ scope: scope }, patch))
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const body = await res.json();
+    if (scope === 'channel') autoData.channel = body.config;
+    else autoData.media[scope] = body.config;
+    showToast('Настройка сохранена');
+  } catch (e) {
+    showToast('Не удалось сохранить настройку', true);
+    loadAuto(true);
+  }
+}
+
+function renderChannelPanel() {
+  const cfg = scopeConfig('channel');
+  const answers = cfg.answers || [];
+  const variants = answers.length
+    ? answers.map((a, i) => variantRowHtml('channel', i, a)).join('')
+    : '<div class="variants-empty">Вариантов пока нет — добавьте первый ответ.</div>';
+  const box = document.getElementById('channel_panel');
+  box.innerHTML =
+    '<div class="toggle-row">' +
+      '<div class="toggle-row__label"><b>Отвечать на посты канала</b><span>Бот отвечает случайным вариантом с шансом ниже</span></div>' +
+      '<label class="switch"><input type="checkbox" data-ctoggle="enabled"' + (cfg.enabled ? ' checked' : '') + '><i></i></label>' +
+    '</div>' +
+    '<div class="toggle-row">' +
+      '<div class="toggle-row__label"><b>В группах</b><span>Пост канала появился в группе — бот отвечает первым</span></div>' +
+      '<label class="switch"><input type="checkbox" data-ctoggle="in_groups"' + (cfg.in_groups ? ' checked' : '') + '><i></i></label>' +
+    '</div>' +
+    '<div class="toggle-row">' +
+      '<div class="toggle-row__label"><b>В самом канале</b><span>Бот комментирует посты внутри канала (нужны права админа)</span></div>' +
+      '<label class="switch"><input type="checkbox" data-ctoggle="in_channels"' + (cfg.in_channels ? ' checked' : '') + '><i></i></label>' +
+    '</div>' +
+    '<div class="chance-row">' +
+      '<input type="range" min="0" max="100" step="5" value="' + (cfg.chance || 0) + '" data-chance="channel" onchange="onChanceChange(this)">' +
+      '<span class="chance-val" data-chance-val="channel">' + (cfg.chance || 0) + '%</span>' +
+    '</div>' +
+    '<div class="auto-section" style="margin-bottom:10px;">' + variants + '</div>' +
+    '<button class="btn btn--glass btn--sm btn--block" type="button" style="border-style:dashed;" onclick="openAnswerEditor(\'channel\', -1)">' +
+      '<i data-lucide="plus"></i><span>Добавить вариант ответа</span>' +
+    '</button>';
+  bindAutoCardActions(box);
+  box.querySelectorAll('[data-ctoggle]').forEach(el => {
+    el.addEventListener('change', () => {
+      const patch = {};
+      patch[el.dataset.ctoggle] = el.checked;
+      saveScopeConfig('channel', patch);
+    });
+  });
+}
+
+function renderSettingsPanel() {
+  const st = autoData.settings || {};
+  const box = document.getElementById('settings_panel');
+  box.innerHTML =
+    '<div class="toggle-row">' +
+      '<div class="toggle-row__label"><b>Игнорировать других ботов</b><span>Защита от бесконечных петель между ботами</span></div>' +
+      '<label class="switch"><input type="checkbox" id="set_ignore_bots"' + (st.ignore_bots ? ' checked' : '') + '><i></i></label>' +
+    '</div>' +
+    '<div class="field" style="margin-top:13px;">' +
+      '<span class="field__label">Кулдаун автоответов, сек (0 — выключен)</span>' +
+      '<input type="number" id="set_cooldown" min="0" max="3600" value="' + (st.cooldown || 0) + '">' +
+      '<span class="field__hint">Минимальная пауза между автоответами бота в одном чате — защита от спама.</span>' +
+    '</div>' +
+    '<div class="field">' +
+      '<span class="field__label">Случайная задержка перед медиа-реакцией, сек</span>' +
+      '<div class="num-row">' +
+        '<div class="num-cell"><span>От</span><input type="number" id="set_delay_min" min="0" max="120" value="' + (st.delay_min || 0) + '"></div>' +
+        '<div class="num-cell"><span>До</span><input type="number" id="set_delay_max" min="0" max="120" value="' + (st.delay_max || 0) + '"></div>' +
+        '<div class="num-cell"><span>&nbsp;</span><button class="btn btn--light btn--sm" type="button" style="width:100%;" onclick="saveSettings()"><span>Сохранить</span></button></div>' +
+      '</div>' +
+      '<span class="field__hint">Пауза делает реакции живыми — как будто человек посмотрел медиа и ответил.</span>' +
+    '</div>' +
+    '<div class="stat-list" style="margin-top:8px;">' +
+      '<div class="stat-row"><span>Ответов по триггерам</span><b id="auto_stat_triggers">' + ((autoData.stats || {}).triggers || 0) + '</b></div>' +
+      '<div class="stat-row"><span>Медиа-реакций</span><b id="auto_stat_media2">' + ((autoData.stats || {}).media || 0) + '</b></div>' +
+      '<div class="stat-row"><span>Ответов на посты канала</span><b id="auto_stat_channel2">' + ((autoData.stats || {}).channel || 0) + '</b></div>' +
+    '</div>' +
+    '<button class="btn btn--glass btn--sm btn--block" type="button" style="margin-top:12px;" onclick="resetStats()">' +
+      '<i data-lucide="trash-2"></i><span>Сбросить счётчики</span>' +
+    '</button>';
+}
+
+async function saveSettings() {
+  const payload = {
+    ignore_bots: document.getElementById('set_ignore_bots').checked,
+    cooldown: parseInt(document.getElementById('set_cooldown').value || '0', 10) || 0,
+    delay_min: parseInt(document.getElementById('set_delay_min').value || '0', 10) || 0,
+    delay_max: parseInt(document.getElementById('set_delay_max').value || '0', 10) || 0
+  };
+  try {
+    const res = await apiFetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const body = await res.json();
+    autoData.settings = body.settings;
+    showToast('Настройки сохранены');
+  } catch (e) {
+    showToast('Не удалось сохранить настройки', true);
+  }
+}
+
+async function resetStats() {
+  if (!confirm('Обнулить счётчики автоответов?')) return;
+  try {
+    const res = await apiFetch('/api/stats/reset', { method: 'POST' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const body = await res.json();
+    autoData.stats = body.stats;
+    renderSettingsPanel();
+    renderAutoStats();
+    refreshIcons();
+    showToast('Счётчики сброшены');
+  } catch (e) {
+    showToast('Не удалось сбросить счётчики', true);
+  }
+}
+
+function openAnswerEditor(scope, index) {
+  editingScope = scope;
+  editingIndex = index;
+  const answers = scopeConfig(scope).answers || [];
+  const item = (index >= 0 && index < answers.length) ? answers[index] : null;
+
+  const scopeTitle = scope === 'channel' ? 'Посты канала' : AUTO_MEDIA_TITLES[scope];
+  document.getElementById('answer_eyebrow').textContent = item ? 'Edit variant' : 'New variant';
+  document.getElementById('answer_title').textContent = (item ? 'Редактирование · ' : 'Новый вариант · ') + scopeTitle;
+
+  document.getElementById('answer_text').value = item ? (item.html_text || '') : '';
+  answerMediaType = item ? (item.media_type || 'text') : 'text';
+  answerFileId = item ? (item.file_id || '') : '';
+  document.getElementById('answer_media_type').value = answerMediaType;
+  document.getElementById('answer_file_id').value = answerFileId;
+  document.getElementById('answer_file').value = '';
+  document.getElementById('answer_file_name').textContent = 'Файл не выбран';
+
+  const box = document.getElementById('answer_buttons_box');
+  box.innerHTML = '';
+  if (item && item.buttons) {
+    item.buttons.forEach(row => {
+      row.forEach((btn, idx) => addAnswerBtnRow(btn.text, btn.url, idx > 0));
+    });
+  }
+
+  updateAnswerMediaNote();
+  const modal = document.getElementById('answer_modal');
+  modal.classList.add('is-open');
+  modal.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('locked');
+  refreshIcons();
+}
+
+function closeAnswerEditor() {
+  const modal = document.getElementById('answer_modal');
+  modal.classList.remove('is-open');
+  modal.setAttribute('aria-hidden', 'true');
+  if (document.getElementById('auth_overlay').style.display === 'none' &&
+      !document.getElementById('editor_modal').classList.contains('is-open')) {
+    document.body.classList.remove('locked');
+  }
+  editingScope = '';
+  editingIndex = -1;
+}
+
+function onAnswerFileChange() {
+  const file = document.getElementById('answer_file').files[0];
+  document.getElementById('answer_file_name').textContent = file ? file.name : 'Файл не выбран';
+}
+
+function updateAnswerMediaNote() {
+  const note = document.getElementById('answer_media_note');
+  const hasExisting = answerFileId && answerMediaType && answerMediaType !== 'text';
+  note.hidden = !hasExisting;
+  document.getElementById('answer_media_label').textContent = mediaLabel(answerMediaType);
+}
+
+function removeAnswerMedia() {
+  answerMediaType = 'text';
+  answerFileId = '';
+  document.getElementById('answer_media_type').value = 'text';
+  document.getElementById('answer_file_id').value = '';
+  updateAnswerMediaNote();
+}
+
+function addAnswerBtnRow(text, url, sameRow) {
+  const box = document.getElementById('answer_buttons_box');
+  const row = document.createElement('div');
+  row.className = 'btn-row';
+  row.innerHTML =
+    '<input type="text" class="b-text" placeholder="Текст кнопки">' +
+    '<input type="text" class="b-url" placeholder="https://... или @bot">' +
+    '<label class="check"><input type="checkbox" class="b-same"> В ряд</label>' +
+    '<button type="button" class="icon-btn icon-btn--danger" title="Удалить кнопку"><i data-lucide="x"></i></button>';
+  row.querySelector('.b-text').value = text || '';
+  row.querySelector('.b-url').value = url || '';
+  row.querySelector('.b-same').checked = Boolean(sameRow);
+  row.querySelector('.icon-btn').addEventListener('click', () => row.remove());
+  box.appendChild(row);
+  refreshIcons();
+}
+
+function collectAnswerButtons() {
+  const rows = [];
+  document.querySelectorAll('#answer_buttons_box .btn-row').forEach(el => {
+    const text = el.querySelector('.b-text').value.trim();
+    let url = el.querySelector('.b-url').value.trim();
+    const same = el.querySelector('.b-same').checked;
+    if (!text || !url) return;
+    if (url.startsWith('@')) url = 'https://t.me/' + url.slice(1);
+    if (same && rows.length > 0) rows[rows.length - 1].push({ text: text, url: url });
+    else rows.push([{ text: text, url: url }]);
+  });
+  return rows;
+}
+
+async function saveAnswer() {
+  if (!editingScope) return;
+  const btn = document.getElementById('answer_save_btn');
+  btn.disabled = true;
+  const form = new FormData();
+  form.append('scope', editingScope);
+  form.append('index', String(editingIndex));
+  form.append('html_text', document.getElementById('answer_text').value);
+  form.append('buttons', JSON.stringify(collectAnswerButtons()));
+  form.append('existing_media_type', answerMediaType);
+  form.append('existing_file_id', answerFileId);
+  const fileInput = document.getElementById('answer_file');
+  if (fileInput.files.length > 0) form.append('file', fileInput.files[0]);
+  try {
+    const res = await apiFetch('/api/auto/answer', { method: 'POST', body: form });
+    const body = await res.text();
+    if (res.ok) {
+      closeAnswerEditor();
+      await loadAuto(true);
+      showToast('Вариант сохранён');
+    } else {
+      showToast(body || 'Ошибка сохранения', true);
+    }
+  } catch (e) {
+    showToast('Не удалось сохранить вариант', true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function deleteAnswer(scope, index) {
+  if (!confirm('Удалить этот вариант ответа?')) return;
+  try {
+    const res = await apiFetch('/api/auto/answer?scope=' + encodeURIComponent(scope) + '&index=' + index, { method: 'DELETE' });
+    if (res.ok) {
+      await loadAuto(true);
+      showToast('Вариант удалён');
+    } else {
+      showToast('Ошибка удаления', true);
+    }
+  } catch (e) {
+    showToast('Не удалось удалить вариант', true);
+  }
+}
+
+// ===== КОНЕЦ АВТООТВЕТОВ =====
+
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') {
+    const answerModal = document.getElementById('answer_modal');
+    if (answerModal.classList.contains('is-open')) {
+      closeAnswerEditor();
+      return;
+    }
     const modal = document.getElementById('editor_modal');
     if (modal.classList.contains('is-open')) closeEditor();
     else toggleSidebar(false);
@@ -3278,6 +4273,26 @@ dropzone.addEventListener('drop', event => {
   }
 });
 
+const answerDropzone = document.getElementById('answer_dropzone');
+['dragenter', 'dragover'].forEach(name => {
+  answerDropzone.addEventListener(name, event => {
+    event.preventDefault();
+    answerDropzone.classList.add('is-drag');
+  });
+});
+['dragleave', 'drop'].forEach(name => {
+  answerDropzone.addEventListener(name, event => {
+    event.preventDefault();
+    answerDropzone.classList.remove('is-drag');
+  });
+});
+answerDropzone.addEventListener('drop', event => {
+  if (event.dataTransfer.files.length) {
+    document.getElementById('answer_file').files = event.dataTransfer.files;
+    onAnswerFileChange();
+  }
+});
+
 window.addEventListener('resize', () => {
   if (window.innerWidth > 980) toggleSidebar(false);
 });
@@ -3285,7 +4300,10 @@ window.addEventListener('resize', () => {
 refreshIcons();
 if (authPass) {
   loadTriggers(true).then(ok => {
-    if (ok) unlockPanel();
+    if (ok) {
+      unlockPanel();
+      loadAuto(true);
+    }
   });
 } else {
   setTimeout(() => document.getElementById('pass_input').focus(), 150);
@@ -3468,7 +4486,204 @@ async def handle_delete_trigger(request: web.Request):
     return web.json_response({"ok": True})
 
 
-async def start_web_server():
+# --- API АВТООТВЕТОВ ---
+
+
+def parse_auto_scope(scope: str) -> tuple[str, str | None]:
+    """'media:photo' или просто 'photo' -> ('media', 'photo'), 'channel' -> ('channel', None)."""
+    scope = (scope or "").strip()
+    if scope == "channel":
+        return "channel", None
+    if scope.startswith("media:"):
+        media_type = scope.split(":", 1)[1]
+        if media_type in AUTO_MEDIA_TYPES:
+            return "media", media_type
+    if scope in AUTO_MEDIA_TYPES:
+        return "media", scope
+    return "", None
+
+
+async def handle_get_auto(request: web.Request):
+    check_auth(request)
+    return web.json_response(
+        {
+            "media": await get_all_media_configs(),
+            "channel": await get_channel_config(),
+            "settings": await get_settings(),
+            "stats": await get_stats(),
+        }
+    )
+
+
+async def handle_save_auto_config(request: web.Request):
+    check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.Response(status=400, text="Некорректный JSON")
+    if not isinstance(body, dict):
+        return web.Response(status=400, text="Некорректный JSON")
+
+    scope, media_type = parse_auto_scope(str(body.get("scope", "")))
+    if not scope:
+        return web.Response(status=400, text="Неизвестный scope")
+
+    if scope == "channel":
+        config = await get_channel_config()
+        for field in ("enabled", "chance", "in_groups", "in_channels"):
+            if field in body:
+                config[field] = body[field]
+        await save_channel_config(config)
+        return web.json_response({"ok": True, "config": await get_channel_config()})
+
+    config = await get_media_config(media_type)
+    for field in ("enabled", "chance"):
+        if field in body:
+            config[field] = body[field]
+    await save_media_config(media_type, config)
+    return web.json_response({"ok": True, "config": await get_media_config(media_type)})
+
+
+async def handle_save_auto_answer(request: web.Request):
+    check_auth(request)
+    reader = await request.multipart()
+    fields = {}
+    file_bytes = None
+    file_name = None
+    content_type = ""
+
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "file":
+            file_name = part.filename
+            content_type = part.headers.get("Content-Type", "")
+            file_bytes = await part.read()
+        else:
+            fields[part.name] = await part.text()
+
+    scope, media_type = parse_auto_scope(fields.get("scope", ""))
+    if not scope:
+        return web.Response(status=400, text="Неизвестный scope")
+
+    try:
+        index = int(fields.get("index", "-1"))
+    except (TypeError, ValueError):
+        index = -1
+
+    try:
+        buttons = clean_buttons(json.loads(fields.get("buttons", "[]")))
+    except Exception:
+        return web.Response(status=400, text="Некорректный список кнопок")
+
+    if scope == "channel":
+        config = await get_channel_config()
+    else:
+        config = await get_media_config(media_type)
+
+    media_type_saved = fields.get("existing_media_type", "text") or "text"
+    file_id = fields.get("existing_file_id") or None
+
+    if file_bytes and file_name:
+        try:
+            inp = BufferedInputFile(file_bytes, filename=file_name)
+            if content_type.startswith("image/gif"):
+                sent = await bot.send_animation(ADMIN_ID, inp)
+                media_type_saved, file_id = "animation", sent.animation.file_id
+            elif content_type.startswith("image/"):
+                sent = await bot.send_photo(ADMIN_ID, inp)
+                media_type_saved, file_id = "photo", sent.photo[-1].file_id
+            elif content_type.startswith("video/"):
+                sent = await bot.send_video(ADMIN_ID, inp)
+                media_type_saved, file_id = "video", sent.video.file_id
+            elif content_type.startswith("audio/"):
+                sent = await bot.send_audio(ADMIN_ID, inp)
+                media_type_saved, file_id = "audio", sent.audio.file_id
+            else:
+                sent = await bot.send_document(ADMIN_ID, inp)
+                media_type_saved, file_id = "document", sent.document.file_id
+            try:
+                await bot.delete_message(ADMIN_ID, sent.message_id)
+            except Exception:
+                pass
+        except Exception as e:
+            return web.Response(status=502, text=f"Не удалось загрузить медиа: {e}")
+
+    if media_type_saved != "text" and not file_id:
+        media_type_saved = "text"
+
+    answer = {
+        "media_type": media_type_saved,
+        "file_id": file_id,
+        "html_text": fields.get("html_text", ""),
+        "buttons": buttons,
+    }
+
+    answers = list(config.get("answers", []))
+    if 0 <= index < len(answers):
+        answers[index] = answer
+    else:
+        answers.append(answer)
+    config["answers"] = answers
+
+    if scope == "channel":
+        await save_channel_config(config)
+    else:
+        await save_media_config(media_type, config)
+    return web.json_response({"ok": True})
+
+
+async def handle_delete_auto_answer(request: web.Request):
+    check_auth(request)
+    scope, media_type = parse_auto_scope(request.query.get("scope", ""))
+    if not scope:
+        return web.Response(status=400, text="Неизвестный scope")
+    try:
+        index = int(request.query.get("index", "-1"))
+    except (TypeError, ValueError):
+        index = -1
+
+    if scope == "channel":
+        config = await get_channel_config()
+    else:
+        config = await get_media_config(media_type)
+
+    answers = list(config.get("answers", []))
+    if 0 <= index < len(answers):
+        answers.pop(index)
+        config["answers"] = answers
+        if scope == "channel":
+            await save_channel_config(config)
+        else:
+            await save_media_config(media_type, config)
+    return web.json_response({"ok": True})
+
+
+async def handle_save_settings(request: web.Request):
+    check_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.Response(status=400, text="Некорректный JSON")
+    if not isinstance(body, dict):
+        return web.Response(status=400, text="Некорректный JSON")
+
+    settings = await get_settings()
+    for field in ("ignore_bots", "cooldown", "delay_min", "delay_max"):
+        if field in body:
+            settings[field] = body[field]
+    await save_settings_db(settings)
+    return web.json_response({"ok": True, "settings": await get_settings()})
+
+
+async def handle_reset_stats(request: web.Request):
+    check_auth(request)
+    await reset_stats_db()
+    return web.json_response({"ok": True, "stats": await get_stats()})
+
+
+def build_web_app() -> web.Application:
     app = web.Application(client_max_size=50 * 1024 * 1024)
     app.router.add_get("/", handle_index)
     app.router.add_get("/ping", handle_ping)
@@ -3476,7 +4691,17 @@ async def start_web_server():
     app.router.add_get("/api/export", handle_export_triggers)
     app.router.add_post("/api/triggers", handle_save_trigger)
     app.router.add_delete("/api/triggers", handle_delete_trigger)
-    runner = web.AppRunner(app)
+    app.router.add_get("/api/auto", handle_get_auto)
+    app.router.add_post("/api/auto/config", handle_save_auto_config)
+    app.router.add_post("/api/auto/answer", handle_save_auto_answer)
+    app.router.add_delete("/api/auto/answer", handle_delete_auto_answer)
+    app.router.add_post("/api/settings", handle_save_settings)
+    app.router.add_post("/api/stats/reset", handle_reset_stats)
+    return app
+
+
+async def start_web_server():
+    runner = web.AppRunner(build_web_app())
     await runner.setup()
     site = web.TCPSite(runner, WEB_HOST, WEB_PORT)
     await site.start()

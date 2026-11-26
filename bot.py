@@ -31,6 +31,13 @@ WEB_PORT = int(os.getenv("PORT", "8080"))
 STRANGER_REPLY = "Скачать игру можно тут:\n@noominora_bot"
 DB_HASH_KEY = "bot:triggers"
 
+VALID_MATCH_TYPES = ("exact", "contains", "regex")
+MATCH_TYPE_LABELS = {
+    "exact": "Точное",
+    "contains": "Содержит",
+    "regex": "Regex",
+}
+
 if not TOKEN:
     raise RuntimeError("Не задана переменная окружения BOT_TOKEN")
 if not REDIS_URL:
@@ -48,10 +55,57 @@ dp.include_router(router)
 
 class MenuState(StatesGroup):
     waiting_phrase = State()
+    waiting_type = State()
     waiting_answer = State()
 
 
 # --- РАБОТА С БАЗОЙ В REDIS ---
+
+_regex_cache: dict[str, re.Pattern] = {}
+REGEX_CACHE_LIMIT = 500
+
+
+def clear_regex_cache() -> None:
+    _regex_cache.clear()
+
+
+def legacy_regex_pattern(phrase: str) -> str:
+    """Безопасный regex для старых записей: ведёт себя как «Содержит»."""
+    return re.escape(phrase)
+
+
+def get_item_match_type(key: str, item: dict | None) -> str:
+    match_type = (item or {}).get("match_type")
+    return match_type if match_type in VALID_MATCH_TYPES else "regex"
+
+
+def get_item_pattern(key: str, item: dict | None) -> str:
+    if get_item_match_type(key, item) != "regex":
+        return key
+    return (item or {}).get("pattern") or legacy_regex_pattern(key)
+
+
+def normalize_trigger(key: str, data: dict | None) -> dict:
+    """Дополняет запись недостающими полями, не удаляя существующие данные."""
+    item = dict(data or {})
+    match_type = item.get("match_type")
+    if match_type not in VALID_MATCH_TYPES:
+        item["match_type"] = "regex"
+        if not item.get("pattern"):
+            item["pattern"] = legacy_regex_pattern(key)
+    elif match_type == "regex" and not item.get("pattern"):
+        item["pattern"] = key
+    return item
+
+
+def get_regex(pattern: str) -> re.Pattern:
+    rx = _regex_cache.get(pattern)
+    if rx is None:
+        rx = re.compile(pattern, re.IGNORECASE | re.UNICODE)
+        if len(_regex_cache) >= REGEX_CACHE_LIMIT:
+            _regex_cache.clear()
+        _regex_cache[pattern] = rx
+    return rx
 
 
 async def get_all_triggers() -> dict:
@@ -59,9 +113,12 @@ async def get_all_triggers() -> dict:
     result = {}
     for k, v in raw.items():
         try:
-            result[k] = json.loads(v)
+            data = json.loads(v)
         except Exception:
             continue
+        if not isinstance(data, dict):
+            continue
+        result[k] = normalize_trigger(k, data)
     return result
 
 
@@ -69,19 +126,122 @@ async def get_trigger(phrase: str) -> dict | None:
     raw = await redis_client.hget(DB_HASH_KEY, phrase)
     if not raw:
         return None
-    return json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return normalize_trigger(phrase, data)
 
 
 async def save_trigger_db(phrase: str, data: dict) -> None:
+    clear_regex_cache()
     await redis_client.hset(DB_HASH_KEY, phrase, json.dumps(data, ensure_ascii=False))
 
 
 async def delete_trigger_db(phrase: str) -> None:
+    clear_regex_cache()
     await redis_client.hdel(DB_HASH_KEY, phrase)
 
 
 async def count_triggers() -> int:
     return await redis_client.hlen(DB_HASH_KEY)
+
+
+async def summarize_triggers(db: dict | None = None) -> dict:
+    db = db if db is not None else await get_all_triggers()
+    summary = {
+        "total": len(db),
+        "exact": 0,
+        "contains": 0,
+        "regex": 0,
+        "media": 0,
+        "buttons": 0,
+    }
+    for key, item in db.items():
+        summary[get_item_match_type(key, item)] += 1
+        if item.get("file_id") and (item.get("media_type") or "text") != "text":
+            summary["media"] += 1
+        summary["buttons"] += sum(len(row) for row in item.get("buttons", []) or [])
+    return summary
+
+
+async def migrate_legacy_triggers() -> int:
+    """Старые записи переводим в Regex с экранированием, сохраняя все данные."""
+    raw = await redis_client.hgetall(DB_HASH_KEY)
+    migrated = 0
+    for key, value in raw.items():
+        try:
+            data = json.loads(value)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        changed = False
+        if data.get("match_type") not in VALID_MATCH_TYPES:
+            data["match_type"] = "regex"
+            changed = True
+        if data["match_type"] == "regex" and not data.get("pattern"):
+            data["pattern"] = legacy_regex_pattern(key)
+            changed = True
+
+        if changed:
+            await redis_client.hset(
+                DB_HASH_KEY, key, json.dumps(data, ensure_ascii=False)
+            )
+            migrated += 1
+
+    if migrated:
+        clear_regex_cache()
+        print(
+            f"Миграция: {migrated} старых записей переведены в Regex с экранированием"
+        )
+    return migrated
+
+
+def find_matching_trigger(text: str, db: dict) -> tuple[str, dict] | None:
+    """Ищет лучший триггер: точное совпадение > «Содержит» > Regex."""
+    normalized = text.strip().casefold()
+    best_key = None
+    best_item = None
+    best_weight = -1
+    best_length = -1
+
+    for key in sorted(db):
+        item = db[key]
+        match_type = get_item_match_type(key, item)
+        matched = False
+        weight = 1
+        length = len(key)
+
+        if match_type == "exact":
+            matched = normalized == key.casefold()
+            weight = 3
+        elif match_type == "contains":
+            matched = key.casefold() in normalized
+            weight = 2
+        else:
+            pattern = get_item_pattern(key, item)
+            length = len(pattern)
+            try:
+                matched = get_regex(pattern).search(text) is not None
+            except re.error:
+                matched = False
+
+        if not matched:
+            continue
+
+        if weight > best_weight or (weight == best_weight and length > best_length):
+            best_key = key
+            best_item = item
+            best_weight = weight
+            best_length = length
+
+    if best_key is None:
+        return None
+    return best_key, best_item
 
 
 # --- ПАРСИНГ И ОТПРАВКА СООБЩЕНИЙ ---
@@ -202,12 +362,13 @@ def back_menu_kb() -> InlineKeyboardMarkup:
 
 
 async def main_menu_text() -> str:
-    total = await count_triggers()
+    summary = await summarize_triggers()
     render_url = os.getenv("RENDER_EXTERNAL_URL", "")
     web_line = f"Веб-панель: <code>{render_url}</code>\n" if render_url else ""
     return (
         "<b>Панель управления заготовками</b>\n\n"
-        f"Активных фраз в базе: <b>{total}</b>\n"
+        f"Активных фраз в базе: <b>{summary['total']}</b>\n"
+        f"Точные: <b>{summary['exact']}</b> · Содержит: <b>{summary['contains']}</b> · Regex: <b>{summary['regex']}</b>\n"
         f"{web_line}"
         "Хранилище: <b>Upstash Redis</b>\n\n"
         "Выберите действие ниже:"
@@ -265,9 +426,9 @@ async def cb_add_start(call: CallbackQuery, state: FSMContext):
     await state.set_state(MenuState.waiting_phrase)
     await state.update_data(menu_msg_id=call.message.message_id)
     text = (
-        "<b>Шаг 1 из 2 — Фраза-триггер</b>\n\n"
+        "<b>Шаг 1 из 3 — Фраза-триггер</b>\n\n"
         "Отправь слово или фразу, на которую бот должен отвечать в чате.\n"
-        "<i>Регистр букв не имеет значения.</i>"
+        "<i>Для «Точного» и «Содержит» регистр букв не имеет значения.</i>"
     )
     await safe_edit_menu(call.message.chat.id, call.message.message_id, text, back_menu_kb())
     await call.answer()
@@ -292,25 +453,82 @@ async def step_phrase(message: Message, state: FSMContext):
         await state.update_data(menu_msg_id=new_id)
         return
 
-    phrase = message.text.strip().lower()
+    phrase = message.text.strip()
     await state.update_data(phrase=phrase)
-    await state.set_state(MenuState.waiting_answer)
+    await state.set_state(MenuState.waiting_type)
 
     text = (
-        f"<b>Шаг 2 из 2 — Ответ на «{html.escape(phrase)}»</b>\n\n"
+        "<b>Шаг 2 из 3 — Тип совпадения</b>\n\n"
+        f"Фраза: <code>{html.escape(phrase)}</code>\n\n"
+        "Выбери, как бот должен находить эту фразу в сообщении:"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎯 Точное совпадение", callback_data="addtype:exact")],
+            [InlineKeyboardButton(text="🧩 Содержит в тексте", callback_data="addtype:contains")],
+            [InlineKeyboardButton(text="⚙️ Regex-шаблон", callback_data="addtype:regex")],
+            [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="menu:home")],
+        ]
+    )
+    new_id = await safe_edit_menu(message.chat.id, menu_msg_id, text, kb)
+    await state.update_data(menu_msg_id=new_id)
+
+
+@router.callback_query(F.from_user.id == ADMIN_ID, F.data.startswith("addtype:"))
+async def cb_add_type(call: CallbackQuery, state: FSMContext):
+    if await state.get_state() != MenuState.waiting_type.state:
+        await call.answer("Сессия устарела, начните заново", show_alert=True)
+        return
+
+    match_type = call.data.split(":", 1)[1]
+    if match_type not in VALID_MATCH_TYPES:
+        await call.answer("Неизвестный тип", show_alert=True)
+        return
+
+    data = await state.get_data()
+    phrase = (data.get("phrase") or "").strip()
+    menu_msg_id = data.get("menu_msg_id") or call.message.message_id
+
+    if match_type in ("exact", "contains"):
+        phrase = phrase.lower()
+
+    if match_type == "regex":
+        try:
+            re.compile(phrase, re.IGNORECASE)
+        except re.error as e:
+            await call.answer(f"Ошибка в regex: {e}", show_alert=True)
+            return
+
+    await state.update_data(phrase=phrase, match_type=match_type)
+    await state.set_state(MenuState.waiting_answer)
+
+    type_label = MATCH_TYPE_LABELS[match_type]
+    if match_type == "exact":
+        hint = "Бот ответит, если сообщение <b>полностью совпадёт</b> с фразой."
+    elif match_type == "contains":
+        hint = "Бот ответит, если фраза <b>встретится внутри</b> сообщения."
+    else:
+        hint = "Поиск по регулярному выражению <b>без учёта регистра</b>."
+
+    text = (
+        f"<b>Шаг 3 из 3 — Ответ на «{html.escape(phrase)}»</b>\n"
+        f"Тип: <b>{type_label}</b>\n"
+        f"{hint}\n\n"
         "Отправь готовое сообщение: текст (жирный, курсив, ссылки сохранятся), фото, видео, гифку или пост с кнопками.\n\n"
         "Чтобы добавить свои кнопки, допиши в конце:\n"
         "<code>[Скачать - @noominora_bot]</code>\n"
         "В один ряд через черту: <code>[Кнопка 1 - https://ya.ru] | [Кнопка 2 - @durov]</code>"
     )
-    new_id = await safe_edit_menu(message.chat.id, menu_msg_id, text, back_menu_kb())
+    new_id = await safe_edit_menu(call.message.chat.id, menu_msg_id, text, back_menu_kb())
     await state.update_data(menu_msg_id=new_id)
+    await call.answer()
 
 
 @router.message(F.chat.type == "private", F.from_user.id == ADMIN_ID, MenuState.waiting_answer)
 async def step_answer(message: Message, state: FSMContext):
     data = await state.get_data()
     phrase = data["phrase"]
+    match_type = data.get("match_type", "exact")
     menu_msg_id = data.get("menu_msg_id")
 
     raw_html = message.html_text if message.text else (message.html_caption if message.caption else "")
@@ -319,15 +537,23 @@ async def step_answer(message: Message, state: FSMContext):
     final_rows = parsed_rows or existing_rows
     media_type, file_id = extract_media_info(message)
 
-    await save_trigger_db(
-        phrase,
+    existing = await get_trigger(phrase) or {}
+    item = dict(existing)
+    item.update(
         {
             "media_type": media_type,
             "file_id": file_id,
             "html_text": clean_html,
             "buttons": final_rows,
-        },
+            "match_type": match_type,
+        }
     )
+    if match_type == "regex":
+        item["pattern"] = phrase
+    else:
+        item.pop("pattern", None)
+
+    await save_trigger_db(phrase, item)
 
     try:
         await message.delete()
@@ -337,7 +563,7 @@ async def step_answer(message: Message, state: FSMContext):
     await state.clear()
     status_text = (
         f"✅ Заготовка для <b>«{html.escape(phrase)}»</b> сохранена!\n"
-        f"Тип: <b>{media_type}</b> | Кнопок: <b>{sum(len(r) for r in final_rows)}</b>\n\n"
+        f"Совпадение: <b>{MATCH_TYPE_LABELS.get(match_type, match_type)}</b> | Медиа: <b>{media_type}</b> | Кнопок: <b>{sum(len(r) for r in final_rows)}</b>\n\n"
         + await main_menu_text()
     )
     new_id = await safe_edit_menu(message.chat.id, menu_msg_id, status_text, await main_menu_kb())
@@ -368,7 +594,9 @@ async def cb_list(call: CallbackQuery):
     for idx, phrase in enumerate(chunk, start=start):
         info = db[phrase]
         btn_count = sum(len(r) for r in info.get("buttons", []))
-        label = f"💬 {phrase} [{info.get('media_type', 'text')}, кнопок: {btn_count}]"
+        match_type = get_item_match_type(phrase, info)
+        type_short = {"exact": "Т", "contains": "С", "regex": "R"}[match_type]
+        label = f"{type_short} · {phrase} [{info.get('media_type', 'text')}, кнопок: {btn_count}]"
         rows.append([InlineKeyboardButton(text=label[:55], callback_data=f"menu:item:{idx}")])
 
     nav = []
@@ -390,23 +618,29 @@ async def cb_list(call: CallbackQuery):
     await call.answer()
 
 
-@router.callback_query(F.from_user.id == ADMIN_ID, F.data.startswith("menu:item:"))
-async def cb_item(call: CallbackQuery):
-    idx = int(call.data.split(":")[2])
+async def show_trigger_card(chat_id: int, message_id: int, idx: int) -> bool:
     db = await get_all_triggers()
     keys = sorted(list(db.keys()))
     if idx < 0 or idx >= len(keys):
-        await call.answer("Фраза не найдена", show_alert=True)
-        return
+        return False
 
     phrase = keys[idx]
     info = db[phrase]
+    match_type = get_item_match_type(phrase, info)
     preview_text = info.get("html_text") or "<i>(без текста, только медиа)</i>"
     if len(preview_text) > 500:
         preview_text = preview_text[:500] + "..."
 
+    pattern_line = ""
+    if match_type == "regex":
+        pattern = get_item_pattern(phrase, info)
+        if pattern not in (phrase, legacy_regex_pattern(phrase)):
+            pattern_line = f"<b>Шаблон:</b> <code>{html.escape(pattern)}</code>\n"
+
     text = (
         f"<b>Триггер:</b> <code>{html.escape(phrase)}</code>\n"
+        f"<b>Совпадение:</b> <b>{MATCH_TYPE_LABELS[match_type]}</b>\n"
+        f"{pattern_line}"
         f"<b>Медиа:</b> {info.get('media_type', 'text')}\n"
         f"<b>Кнопок:</b> {sum(len(r) for r in info.get('buttons', []))}\n\n"
         f"<b>Текст ответа:</b>\n{preview_text}"
@@ -417,11 +651,50 @@ async def cb_item(call: CallbackQuery):
                 InlineKeyboardButton(text="👁 Тест в ЛС", callback_data=f"menu:test:{idx}"),
                 InlineKeyboardButton(text="🗑 Удалить", callback_data=f"menu:del:{idx}"),
             ],
+            [
+                InlineKeyboardButton(
+                    text=f"🔁 Тип: {MATCH_TYPE_LABELS[match_type]}",
+                    callback_data=f"menu:type:{idx}",
+                )
+            ],
             [InlineKeyboardButton(text="⬅️ К списку", callback_data="menu:list:0")],
         ]
     )
-    await safe_edit_menu(call.message.chat.id, call.message.message_id, text, kb)
+    await safe_edit_menu(chat_id, message_id, text, kb)
+    return True
+
+
+@router.callback_query(F.from_user.id == ADMIN_ID, F.data.startswith("menu:item:"))
+async def cb_item(call: CallbackQuery):
+    idx = int(call.data.split(":")[2])
+    if not await show_trigger_card(call.message.chat.id, call.message.message_id, idx):
+        await call.answer("Фраза не найдена", show_alert=True)
+        return
     await call.answer()
+
+
+@router.callback_query(F.from_user.id == ADMIN_ID, F.data.startswith("menu:type:"))
+async def cb_cycle_type(call: CallbackQuery):
+    idx = int(call.data.split(":")[2])
+    db = await get_all_triggers()
+    keys = sorted(list(db.keys()))
+    if idx < 0 or idx >= len(keys):
+        await call.answer("Фраза не найдена", show_alert=True)
+        return
+
+    phrase = keys[idx]
+    item = dict(db[phrase])
+    current = get_item_match_type(phrase, item)
+    order = ["exact", "contains", "regex"]
+    new_type = order[(order.index(current) + 1) % len(order)]
+
+    item["match_type"] = new_type
+    if new_type == "regex":
+        item["pattern"] = item.get("pattern") or legacy_regex_pattern(phrase)
+
+    await save_trigger_db(phrase, item)
+    await show_trigger_card(call.message.chat.id, call.message.message_id, idx)
+    await call.answer(f"Тип изменён: {MATCH_TYPE_LABELS[new_type]}")
 
 
 @router.callback_query(F.from_user.id == ADMIN_ID, F.data.startswith("menu:test:"))
@@ -460,765 +733,2321 @@ async def group_auto_reply(message: Message):
     if not incoming:
         return
 
-    key = incoming.strip().lower()
-    item = await get_trigger(key)
+    db = await get_all_triggers()
+    found = find_matching_trigger(incoming, db)
+    if not found:
+        return
 
-    if item:
-        try:
-            await send_trigger_reply(message.chat.id, item, reply_to_message_id=message.message_id)
-        except Exception as e:
-            print(f"Ошибка при отправке ответа в чат: {e}")
+    _, item = found
+    try:
+        await send_trigger_reply(message.chat.id, item, reply_to_message_id=message.message_id)
+    except Exception as e:
+        print(f"Ошибка при отправке ответа в чат: {e}")
 
 
 # --- ВЕБ-ИНТЕРФЕЙС (МИНИМАЛИЗМ: ЧЁРНЫЙ ФОН, БЕЛЫЕ КНОПКИ, UNBOUNDED, LUCIDE ICONS) ---
 
-WEB_HTML = """<!DOCTYPE html>
+WEB_HTML = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TRIGGERS // CONTROL</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TRIGGER STUDIO — панель</title>
+<meta name="theme-color" content="#050505">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='10' fill='%23050505'/%3E%3Cpath d='M9 12h14M9 16h9M9 20h12' stroke='%23f5f3ee' stroke-width='2' stroke-linecap='round'/%3E%3Ccircle cx='24' cy='24' r='3' fill='%239ae6a4'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;500;600;700&display=swap" rel="stylesheet">
-<script src="https://unpkg.com/lucide@latest"></script>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #000000;
-    --surface: #0a0a0a;
-    --surface-2: #121212;
-    --border: #222222;
-    --border-hover: #444444;
-    --text: #ffffff;
-    --muted: #777777;
-    --white: #ffffff;
-    --white-hover: #e5e5e5;
-    --danger: #ff3b30;
+    --bg: #050505;
+    --ink: #f5f3ee;
+    --ink-soft: #d2d0c9;
+    --muted: #8b8981;
+    --dim: #5f5d57;
+    --line: rgba(255, 255, 255, 0.085);
+    --line-strong: rgba(255, 255, 255, 0.18);
+    --glass: rgba(255, 255, 255, 0.036);
+    --glass-2: rgba(255, 255, 255, 0.065);
+    --green: #9ae6a4;
+    --violet: #c3c7ff;
+    --danger: #ff9b9f;
+    --font-display: 'Unbounded', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    --radius: 22px;
   }
 
-  * {
-    box-sizing: border-box;
-    font-family: 'Unbounded', -apple-system, BlinkMacSystemFont, sans-serif;
-  }
+  * { box-sizing: border-box; }
+
+  [hidden] { display: none !important; }
+
+  html { scroll-behavior: smooth; }
 
   body {
     margin: 0;
     min-height: 100vh;
     background: var(--bg);
-    color: var(--text);
-    padding: 32px 20px;
+    color: var(--ink);
+    font-family: var(--font-display);
+    font-size: 12px;
+    letter-spacing: -0.01em;
     -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
   }
 
-  /* Экран входа */
-  #auth_overlay {
+  body.locked { overflow: hidden; }
+
+  ::selection { background: var(--ink); color: #050505; }
+
+  button, input, textarea, select { font: inherit; }
+
+  button { color: inherit; }
+
+  a { color: inherit; }
+
+  code, .mono { font-family: var(--font-mono); }
+
+  .muted { color: var(--muted); }
+
+  .liquid {
     position: fixed;
     inset: 0;
-    z-index: 100;
-    background: #000000;
+    z-index: 0;
+    overflow: hidden;
+    pointer-events: none;
+  }
+
+  .liquid__blob {
+    position: absolute;
+    width: 56vw;
+    height: 56vw;
+    border-radius: 50%;
+    filter: blur(110px);
+    opacity: 0.13;
+  }
+
+  .liquid__blob--1 {
+    top: -24%;
+    left: -14%;
+    background: radial-gradient(circle, #bff7c8, transparent 64%);
+  }
+
+  .liquid__blob--2 {
+    right: -18%;
+    bottom: -30%;
+    background: radial-gradient(circle, #aab5ff, transparent 64%);
+    opacity: 0.1;
+  }
+
+  .grain {
+    position: fixed;
+    inset: 0;
+    z-index: 2;
+    pointer-events: none;
+    opacity: 0.035;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.55'/%3E%3C/svg%3E");
+  }
+
+  .glass {
+    background: linear-gradient(180deg, var(--glass-2), var(--glass));
+    border: 1px solid var(--line);
+    box-shadow: 0 30px 90px rgba(0, 0, 0, 0.42);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+  }
+
+  .app {
+    position: relative;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: 256px minmax(0, 1fr);
+    gap: 14px;
+    max-width: 1480px;
+    min-height: 100vh;
+    margin: 0 auto;
+    padding: 14px;
+    transition: filter 0.3s ease, opacity 0.3s ease;
+  }
+
+  body.locked .app {
+    filter: blur(10px);
+    opacity: 0.45;
+    pointer-events: none;
+  }
+
+  /* ============ AUTH ============ */
+  .auth {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 20px;
+    background: radial-gradient(900px 600px at 50% 0%, rgba(154, 230, 164, 0.06), transparent 60%), #050505;
   }
 
-  .auth-box {
+  .auth__card {
     width: 100%;
-    max-width: 400px;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    border-radius: 20px;
-    padding: 36px 28px;
+    max-width: 410px;
+    border-radius: 26px;
+    padding: 34px 30px 28px;
+    animation: rise 0.5s cubic-bezier(0.2, 0.8, 0.2, 1) both;
   }
 
-  .auth-icon {
-    width: 48px;
-    height: 48px;
-    border-radius: 12px;
-    background: var(--white);
-    color: #000000;
+  .auth__mark {
+    width: 50px;
+    height: 50px;
+    border-radius: 15px;
+    background: var(--ink);
+    color: #050505;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    margin-bottom: 20px;
+    margin-bottom: 24px;
   }
 
-  .wrapper {
-    max-width: 1260px;
-    margin: 0 auto;
+  .auth__mark svg { width: 23px; height: 23px; }
+
+  .auth__card h2 {
+    margin: 8px 0 10px;
+    font-size: 25px;
+    font-weight: 600;
+    letter-spacing: -0.05em;
   }
 
-  /* Шапка */
-  .header {
+  .auth__card > p {
+    margin: 0 0 24px;
+    font-size: 10.5px;
+    line-height: 1.7;
+    color: var(--muted);
+  }
+
+  .auth__card > p code {
+    color: var(--ink-soft);
+    background: rgba(255, 255, 255, 0.06);
+    padding: 2px 6px;
+    border-radius: 6px;
+    font-size: 10px;
+  }
+
+  .auth__hint {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    flex-wrap: wrap;
-    gap: 16px;
-    padding-bottom: 24px;
-    margin-bottom: 28px;
-    border-bottom: 1px solid var(--border);
+    justify-content: center;
+    gap: 7px;
+    margin-top: 18px;
+    font-size: 8.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
+  .auth__hint svg { width: 11px; height: 11px; }
+  .auth.shake { animation: shake 0.4s ease; }
+
+  /* ============ SIDEBAR ============ */
+  .sidebar {
+    position: sticky;
+    top: 14px;
+    height: calc(100vh - 28px);
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    padding: 18px;
+    border-radius: 26px;
+  }
+
+  .sidebar__top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
   }
 
   .brand {
     display: flex;
     align-items: center;
-    gap: 14px;
+    gap: 11px;
+    min-width: 0;
   }
 
-  .brand-mark {
-    width: 40px;
-    height: 40px;
-    background: var(--white);
-    color: #000000;
-    border-radius: 10px;
+  .brand__mark {
+    width: 38px;
+    height: 38px;
+    flex: 0 0 38px;
+    border-radius: 12px;
+    background: var(--ink);
+    color: #050505;
     display: flex;
     align-items: center;
     justify-content: center;
   }
 
-  .brand h1 {
-    margin: 0;
-    font-size: 18px;
-    font-weight: 700;
-    letter-spacing: -0.03em;
+  .brand__mark svg { width: 19px; height: 19px; }
+
+  .brand__text { display: flex; flex-direction: column; gap: 2px; line-height: 1; }
+
+  .brand__text b {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
   }
 
-  .brand p {
-    margin: 3px 0 0 0;
-    font-size: 11px;
+  .brand__text span {
+    font-size: 7.5px;
+    letter-spacing: 0.22em;
     color: var(--muted);
-    font-weight: 400;
   }
 
-  .header-right {
+  .nav {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    scrollbar-width: none;
+  }
+
+  .nav::-webkit-scrollbar { display: none; }
+
+  .nav__group {
+    margin: 14px 10px 7px;
+    font-size: 7.5px;
+    font-weight: 500;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
+  .nav__group:first-child { margin-top: 0; }
+
+  .nav__link {
     display: flex;
     align-items: center;
     gap: 10px;
+    width: 100%;
+    padding: 10px 11px;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 10.5px;
+    text-align: left;
+    cursor: pointer;
+    transition: 0.16s ease;
   }
 
-  .stat-tag {
-    display: inline-flex;
+  .nav__link svg { width: 15px; height: 15px; flex: 0 0 15px; }
+
+  .nav__link:hover {
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--ink-soft);
+  }
+
+  .nav__link.is-active {
+    background: var(--ink);
+    border-color: var(--ink);
+    color: #050505;
+    box-shadow: 0 10px 30px rgba(255, 255, 255, 0.08);
+  }
+
+  .nav__badge {
+    margin-left: auto;
+    min-width: 21px;
+    padding: 2px 6px;
+    border-radius: 99px;
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid var(--line);
+    font-family: var(--font-mono);
+    font-size: 8px;
+    text-align: center;
+    line-height: 1.6;
+    color: var(--ink-soft);
+  }
+
+  .nav__link.is-active .nav__badge {
+    background: rgba(0, 0, 0, 0.12);
+    border-color: rgba(0, 0, 0, 0.12);
+    color: #050505;
+  }
+
+  .sidebar__foot { display: flex; flex-direction: column; gap: 8px; }
+
+  .storage {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 10px 11px;
+    border: 1px solid var(--line);
+    border-radius: 13px;
+    background: rgba(0, 0, 0, 0.18);
+  }
+
+  .storage__dot {
+    width: 6px;
+    height: 6px;
+    flex: 0 0 6px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 0 4px rgba(154, 230, 164, 0.08), 0 0 14px rgba(154, 230, 164, 0.7);
+  }
+
+  .storage div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+
+  .storage b { font-size: 9px; font-weight: 500; }
+
+  .storage span { font-size: 7.5px; color: var(--muted); letter-spacing: 0.04em; }
+
+  .storage svg { width: 13px; height: 13px; margin-left: auto; color: var(--dim); }
+
+  .side-logout {
+    display: flex;
     align-items: center;
     gap: 8px;
-    border: 1px solid var(--border);
-    background: var(--surface);
-    padding: 9px 14px;
-    border-radius: 10px;
-    font-size: 12px;
+    padding: 9px 11px;
+    border: 0;
+    border-radius: 11px;
+    background: transparent;
+    color: var(--dim);
+    font-size: 9px;
+    cursor: pointer;
+    transition: 0.16s;
   }
 
-  .status-dot {
-    width: 7px;
-    height: 7px;
+  .side-logout:hover { color: var(--danger); background: rgba(255, 155, 159, 0.06); }
+
+  .side-logout svg { width: 14px; height: 14px; }
+
+  /* ============ MAIN / TOPBAR ============ */
+  .main {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-width: 0;
+  }
+
+  .topbar {
+    position: sticky;
+    top: 14px;
+    z-index: 30;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
+    border-radius: 18px;
+  }
+
+  .icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    flex: 0 0 34px;
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--muted);
+    cursor: pointer;
+    transition: 0.16s;
+  }
+
+  .icon-btn:hover {
+    border-color: var(--line-strong);
+    background: rgba(255, 255, 255, 0.07);
+    color: var(--ink);
+  }
+
+  .icon-btn svg { width: 15px; height: 15px; }
+
+  .icon-btn--danger:hover {
+    border-color: rgba(255, 155, 159, 0.4);
+    background: rgba(255, 155, 159, 0.08);
+    color: var(--danger);
+  }
+
+  .topbar__burger, .sidebar__close { display: none; }
+
+  .topbar__search {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    flex: 1;
+    min-width: 0;
+    height: 36px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: rgba(0, 0, 0, 0.2);
+  }
+
+  .topbar__search svg { width: 14px; height: 14px; color: var(--dim); flex: 0 0 14px; }
+
+  .topbar__search input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    outline: none;
+    background: transparent;
+    color: var(--ink);
+    font-size: 10.5px;
+  }
+
+  .topbar__search input::placeholder { color: var(--dim); }
+
+  .topbar__right { display: flex; align-items: center; gap: 7px; }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 9px;
+    border: 1px solid var(--line);
+    border-radius: 99px;
+    background: rgba(255, 255, 255, 0.03);
+    font-size: 8px;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  .pill i {
+    width: 4px;
+    height: 4px;
     border-radius: 50%;
-    background: #ffffff;
+    background: var(--green);
+    box-shadow: 0 0 10px var(--green);
   }
 
-  /* Сетка */
-  .grid {
+  .pill--live { color: var(--ink-soft); }
+
+  .pill--exact { color: var(--ink-soft); background: rgba(255, 255, 255, 0.055); }
+  .pill--contains { color: var(--green); background: rgba(154, 230, 164, 0.09); border-color: rgba(154, 230, 164, 0.18); }
+  .pill--regex { color: var(--violet); background: rgba(195, 199, 255, 0.09); border-color: rgba(195, 199, 255, 0.18); }
+  .pill--media { color: var(--muted); }
+
+  .topbar__count {
+    font-size: 9px;
+    color: var(--muted);
+    padding: 0 4px;
+    white-space: nowrap;
+  }
+
+  .topbar__count b { color: var(--ink); font-family: var(--font-mono); font-weight: 500; }
+
+  /* ============ VIEWS ============ */
+  .view {
+    display: none;
+    flex-direction: column;
+    gap: 16px;
+    animation: fade 0.25s ease both;
+  }
+
+  .view.is-active { display: flex; }
+
+  .page-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 10px 4px 2px;
+  }
+
+  .eyebrow {
+    display: block;
+    margin-bottom: 9px;
+    font-size: 7.5px;
+    font-weight: 500;
+    letter-spacing: 0.24em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+
+  .page-head h1 {
+    margin: 0;
+    font-size: clamp(26px, 2.5vw, 36px);
+    font-weight: 600;
+    letter-spacing: -0.06em;
+    line-height: 1;
+  }
+
+  .page-head p {
+    margin: 10px 0 0;
+    max-width: 440px;
+    font-size: 10px;
+    line-height: 1.7;
+    color: var(--muted);
+  }
+
+  .page-head__actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    padding: 10px 14px;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    background: transparent;
+    font-size: 10px;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: 0.16s ease;
+  }
+
+  .btn svg { width: 14px; height: 14px; }
+
+  .btn--light {
+    background: var(--ink);
+    border-color: var(--ink);
+    color: #050505;
+    box-shadow: 0 12px 30px rgba(255, 255, 255, 0.07);
+  }
+
+  .btn--light:hover { background: #ffffff; transform: translateY(-1px); }
+
+  .btn--glass {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: var(--line);
+    color: var(--ink-soft);
+  }
+
+  .btn--glass:hover { border-color: var(--line-strong); background: rgba(255, 255, 255, 0.075); }
+
+  .btn--ghost { color: var(--muted); border-color: transparent; }
+  .btn--ghost:hover { color: var(--ink); background: rgba(255, 255, 255, 0.05); }
+
+  .btn--sm { padding: 8px 11px; font-size: 9px; border-radius: 10px; }
+  .btn--xs { padding: 6px 9px; font-size: 8px; border-radius: 9px; }
+  .btn--block { width: 100%; }
+
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none !important; }
+
+  /* ============ METRICS ============ */
+  .metric-grid {
     display: grid;
-    grid-template-columns: 1.05fr 0.95fr;
-    gap: 24px;
-    align-items: start;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
   }
 
-  @media (max-width: 960px) {
-    .grid { grid-template-columns: 1fr; }
+  .metric {
+    position: relative;
+    overflow: hidden;
+    padding: 16px 17px;
+    border-radius: 18px;
+  }
+
+  .metric::after {
+    content: "";
+    position: absolute;
+    right: -30px;
+    bottom: -50px;
+    width: 120px;
+    height: 120px;
+    border-radius: 50%;
+    background: radial-gradient(circle, rgba(255, 255, 255, 0.08), transparent 70%);
+    pointer-events: none;
+  }
+
+  .metric__top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+
+  .metric__label {
+    font-size: 8px;
+    letter-spacing: 0.13em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .metric__icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 27px;
+    height: 27px;
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--muted);
+  }
+
+  .metric__icon svg { width: 13px; height: 13px; }
+
+  .metric__value {
+    font-size: 31px;
+    font-weight: 500;
+    letter-spacing: -0.07em;
+    line-height: 1;
+  }
+
+  .metric__foot {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 9px;
+    font-size: 8px;
+    color: var(--dim);
+  }
+
+  .metric__foot b { font-weight: 500; color: var(--ink-soft); }
+
+  .metric--green .metric__value { color: var(--green); }
+  .metric--violet .metric__value { color: var(--violet); }
+
+  /* ============ PANELS / GRIDS ============ */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1.1fr 0.9fr;
+    gap: 10px;
+    align-items: stretch;
   }
 
   .panel {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 20px;
-    padding: 26px;
+    padding: 19px;
+    border-radius: var(--radius);
   }
 
-  .panel-head {
+  .panel__head {
     display: flex;
+    align-items: flex-start;
     justify-content: space-between;
-    align-items: center;
-    margin-bottom: 22px;
+    gap: 12px;
+    margin-bottom: 17px;
   }
 
-  .panel-title {
+  .panel__title { font-size: 12px; font-weight: 500; letter-spacing: -0.02em; }
+
+  .panel__sub { margin-top: 5px; font-size: 8.5px; color: var(--muted); }
+
+  .page-subhead {
     display: flex;
     align-items: center;
+    justify-content: space-between;
     gap: 10px;
-    font-size: 15px;
-    font-weight: 600;
+    padding: 4px 4px 0;
     margin: 0;
   }
 
-  label {
-    display: block;
-    font-size: 11px;
-    font-weight: 500;
+  .bars { display: flex; flex-direction: column; gap: 14px; }
+
+  .bar-row__top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 7px;
+    font-size: 9px;
     color: var(--muted);
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    margin: 18px 0 8px 0;
   }
+
+  .bar-row__top b { font-family: var(--font-mono); font-weight: 500; color: var(--ink-soft); }
+
+  .bar {
+    height: 4px;
+    border-radius: 99px;
+    background: rgba(255, 255, 255, 0.065);
+    overflow: hidden;
+  }
+
+  .bar i {
+    display: block;
+    height: 100%;
+    width: 0;
+    border-radius: 99px;
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0.35), var(--ink));
+    transition: width 0.5s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+
+  .bar--contains i { background: linear-gradient(90deg, rgba(154, 230, 164, 0.3), var(--green)); }
+  .bar--regex i { background: linear-gradient(90deg, rgba(195, 199, 255, 0.3), var(--violet)); }
+
+  .stat-list { display: flex; flex-direction: column; }
+
+  .stat-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.055);
+    font-size: 9px;
+    color: var(--muted);
+  }
+
+  .stat-row:last-child { border-bottom: 0; padding-bottom: 0; }
+
+  .stat-row b { font-family: var(--font-mono); font-weight: 500; color: var(--ink); }
+
+  .stat-row .ok { display: inline-flex; align-items: center; gap: 6px; color: var(--green); }
+  .stat-row .ok i { width: 4px; height: 4px; border-radius: 50%; background: var(--green); }
+
+  /* ============ CARDS ============ */
+  .project-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(245px, 1fr));
+    gap: 10px;
+  }
+
+  .trigger {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 156px;
+    padding: 15px;
+    border-radius: 17px;
+    transition: transform 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+  }
+
+  .trigger:hover {
+    transform: translateY(-2px);
+    border-color: var(--line-strong);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.035));
+  }
+
+  .trigger__top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .trigger__badges { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+
+  .trigger__actions { display: flex; align-items: center; gap: 4px; opacity: 0.55; transition: 0.16s; }
+  .trigger:hover .trigger__actions { opacity: 1; }
+
+  .trigger__actions .icon-btn { width: 27px; height: 27px; flex-basis: 27px; border-radius: 8px; }
+  .trigger__actions .icon-btn svg { width: 12px; height: 12px; }
+
+  .trigger__phrase {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 500;
+    letter-spacing: -0.035em;
+    line-height: 1.35;
+    word-break: break-word;
+  }
+
+  .trigger__pattern {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 8.5px;
+    line-height: 1.6;
+    color: var(--violet);
+    word-break: break-all;
+  }
+
+  .trigger__pattern svg { width: 11px; height: 11px; flex: 0 0 11px; margin-top: 1px; }
+
+  .trigger__text {
+    margin: 0;
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    font-size: 9.5px;
+    line-height: 1.65;
+    color: var(--muted);
+    word-break: break-word;
+  }
+
+  .trigger__chips { display: flex; flex-wrap: wrap; gap: 4px; }
+
+  .chip-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+    padding: 4px 7px;
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    background: rgba(0, 0, 0, 0.18);
+    font-size: 8px;
+    color: var(--ink-soft);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chip-link svg { width: 10px; height: 10px; color: var(--dim); flex: 0 0 10px; }
+
+  .trigger__foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: auto;
+    padding-top: 9px;
+    border-top: 1px solid rgba(255, 255, 255, 0.055);
+    font-size: 8px;
+    color: var(--dim);
+  }
+
+  .trigger__foot b { color: var(--muted); font-weight: 500; }
+
+  /* ============ FILTERS / LIST ============ */
+  .filters {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 0 2px;
+  }
+
+  .chips { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 10px;
+    border: 1px solid var(--line);
+    border-radius: 99px;
+    background: rgba(255, 255, 255, 0.025);
+    color: var(--muted);
+    font-size: 8.5px;
+    cursor: pointer;
+    transition: 0.16s;
+  }
+
+  .chip:hover { border-color: var(--line-strong); color: var(--ink-soft); }
+
+  .chip.is-active {
+    background: var(--ink);
+    border-color: var(--ink);
+    color: #050505;
+  }
+
+  .chip b { font-family: var(--font-mono); font-weight: 500; opacity: 0.65; }
+  .chip.is-active b { opacity: 0.55; }
+
+  .list-panel { padding: 17px; }
+
+  .empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 64px 20px;
+    text-align: center;
+    color: var(--muted);
+  }
+
+  .empty__icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 48px;
+    height: 48px;
+    border: 1px solid var(--line);
+    border-radius: 15px;
+    background: rgba(255, 255, 255, 0.03);
+    color: var(--dim);
+  }
+
+  .empty__icon svg { width: 20px; height: 20px; }
+
+  .empty b { font-size: 11px; font-weight: 500; color: var(--ink-soft); }
+  .empty span { font-size: 9px; line-height: 1.7; max-width: 280px; }
+
+  /* ============ EDITOR MODAL ============ */
+  .modal {
+    position: fixed;
+    inset: 0;
+    z-index: 150;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+  }
+
+  .modal.is-open { display: flex; }
+
+  .modal__backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.72);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    animation: fade 0.2s ease both;
+  }
+
+  .modal__card {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    max-width: 1080px;
+    max-height: calc(100vh - 36px);
+    border-radius: 26px;
+    overflow: hidden;
+    animation: rise 0.3s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+
+  .modal__head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 20px 22px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .modal__head h2 {
+    margin: 0;
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: -0.05em;
+  }
+
+  .modal__head .eyebrow { margin-bottom: 7px; }
+
+  .modal__body {
+    padding: 18px 22px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+  }
+
+  .modal__body::-webkit-scrollbar { width: 5px; }
+  .modal__body::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.13); border-radius: 9px; }
+
+  .editor-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.08fr) minmax(0, 0.92fr);
+    gap: 22px;
+    align-items: start;
+  }
+
+  .modal__foot {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 14px 22px;
+    border-top: 1px solid var(--line);
+    background: rgba(0, 0, 0, 0.22);
+  }
+
+  /* ============ FIELDS ============ */
+  .field { display: block; margin-bottom: 17px; }
+
+  .field__label {
+    display: block;
+    margin-bottom: 8px;
+    font-size: 8px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .field__hint {
+    display: block;
+    margin-top: 7px;
+    font-size: 8px;
+    line-height: 1.6;
+    color: var(--dim);
+  }
+
+  .field__hint code { color: var(--violet); font-size: 7.5px; }
+
+  .input-wrap {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: rgba(0, 0, 0, 0.24);
+    transition: border-color 0.16s, background 0.16s;
+  }
+
+  .input-wrap svg { width: 14px; height: 14px; color: var(--dim); flex: 0 0 14px; }
+
+  .input-wrap:focus-within { border-color: var(--line-strong); background: rgba(0, 0, 0, 0.34); }
 
   input[type="text"],
   input[type="password"],
   textarea {
     width: 100%;
-    background: #000000;
-    border: 1px solid var(--border);
-    color: var(--text);
+    border: 1px solid var(--line);
     border-radius: 12px;
-    padding: 13px 14px;
-    font-size: 13px;
-    font-weight: 400;
     outline: none;
-    transition: border-color 0.15s;
+    background: rgba(0, 0, 0, 0.24);
+    color: var(--ink);
+    padding: 12px 13px;
+    font-size: 10.5px;
+    font-weight: 400;
+    transition: border-color 0.16s, background 0.16s;
   }
 
-  input[type="text"]:focus,
-  input[type="password"]:focus,
-  textarea:focus {
-    border-color: var(--white);
-  }
+  .input-wrap input { border: 0; background: transparent; padding: 12px 0; }
+
+  input:focus, textarea:focus { border-color: var(--line-strong); background: rgba(0, 0, 0, 0.34); }
+
+  .input-wrap input:focus { background: transparent; }
+
+  input::placeholder, textarea::placeholder { color: var(--dim); }
 
   textarea {
-    min-height: 120px;
+    min-height: 128px;
     resize: vertical;
-    line-height: 1.5;
+    line-height: 1.65;
+    font-family: var(--font-mono);
+    font-size: 10px;
   }
 
-  /* Тулбар форматирования */
+  .segmented {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 3px;
+    padding: 3px;
+    border: 1px solid var(--line);
+    border-radius: 13px;
+    background: rgba(0, 0, 0, 0.24);
+  }
+
+  .segmented button {
+    padding: 9px 8px;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 9px;
+    cursor: pointer;
+    transition: 0.16s;
+  }
+
+  .segmented button:hover { color: var(--ink-soft); background: rgba(255, 255, 255, 0.04); }
+
+  .segmented button.is-active {
+    background: var(--ink);
+    color: #050505;
+    box-shadow: 0 8px 20px rgba(255, 255, 255, 0.08);
+  }
+
   .toolbar {
     display: flex;
-    gap: 6px;
+    align-items: center;
+    gap: 4px;
     flex-wrap: wrap;
     margin-bottom: 8px;
   }
 
   .tool-btn {
-    background: #000000;
-    border: 1px solid var(--border);
-    color: var(--text);
-    padding: 7px 11px;
-    border-radius: 8px;
-    font-size: 11px;
-    font-weight: 500;
-    cursor: pointer;
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    transition: 0.15s;
-  }
-
-  .tool-btn:hover {
-    border-color: var(--white);
-    background: var(--surface-2);
-  }
-
-  /* Белые кнопки */
-  .btn-white {
-    background: var(--white);
-    color: #000000;
-    border: 1px solid var(--white);
-    padding: 13px 18px;
-    border-radius: 12px;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    transition: background 0.15s, transform 0.1s;
-  }
-
-  .btn-white:hover {
-    background: var(--white-hover);
-  }
-
-  .btn-white:active {
-    transform: scale(0.99);
-  }
-
-  .btn-white:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .btn-outline {
-    background: transparent;
-    color: var(--text);
-    border: 1px solid var(--border);
-    padding: 9px 13px;
-    border-radius: 10px;
-    font-size: 12px;
-    font-weight: 500;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    transition: 0.15s;
-  }
-
-  .btn-outline:hover {
-    border-color: var(--white);
-  }
-
-  .btn-del {
-    background: transparent;
+    padding: 6px 8px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.18);
     color: var(--muted);
-    border: 1px solid var(--border);
-    padding: 8px 10px;
-    border-radius: 10px;
-    font-size: 12px;
+    font-size: 8.5px;
     cursor: pointer;
-    display: inline-flex;
+    transition: 0.16s;
+  }
+
+  .tool-btn:hover { border-color: var(--line-strong); color: var(--ink); background: rgba(255, 255, 255, 0.05); }
+  .tool-btn svg { width: 12px; height: 12px; }
+
+  /* ============ DROPZONE ============ */
+  .dropzone {
+    position: relative;
+    display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
-    transition: 0.15s;
+    gap: 7px;
+    padding: 24px 16px;
+    border: 1px dashed var(--line-strong);
+    border-radius: 14px;
+    background: rgba(0, 0, 0, 0.16);
+    text-align: center;
+    cursor: pointer;
+    transition: 0.18s;
   }
 
-  .btn-del:hover {
-    border-color: var(--danger);
-    color: var(--danger);
+  .dropzone:hover, .dropzone.is-drag {
+    border-color: rgba(255, 255, 255, 0.35);
+    background: rgba(255, 255, 255, 0.04);
   }
 
-  /* Конструктор кнопок */
-  .btn-row {
+  .dropzone svg { width: 21px; height: 21px; color: var(--dim); }
+
+  .dropzone b { font-size: 9px; font-weight: 500; color: var(--ink-soft); word-break: break-all; }
+  .dropzone span { font-size: 8px; color: var(--dim); }
+
+  .dropzone input[type="file"] {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0;
+    cursor: pointer;
+  }
+
+  .media-existing {
     display: flex;
-    gap: 8px;
     align-items: center;
+    justify-content: space-between;
+    gap: 10px;
     margin-top: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.025);
+    font-size: 8.5px;
+    color: var(--muted);
   }
 
-  .check-wrap {
+  .media-existing span { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+  .media-existing svg { width: 12px; height: 12px; flex: 0 0 12px; }
+  .media-existing b { color: var(--ink-soft); font-weight: 500; }
+
+  .media-existing button {
+    border: 0;
+    background: transparent;
+    color: var(--danger);
+    font-size: 8px;
+    cursor: pointer;
+    padding: 3px 5px;
+    border-radius: 6px;
+  }
+
+  .media-existing button:hover { background: rgba(255, 155, 159, 0.08); }
+
+  /* ============ BUTTONS BUILDER ============ */
+  .btn-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr) auto auto;
+    gap: 6px;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+
+  .btn-row input[type="text"] { padding: 10px 11px; font-size: 9.5px; }
+
+  .check {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    font-size: 11px;
+    gap: 5px;
+    font-size: 8px;
     color: var(--muted);
     white-space: nowrap;
     cursor: pointer;
-    margin: 0;
-    text-transform: none;
-    letter-spacing: 0;
+    user-select: none;
   }
 
-  .check-wrap input {
-    accent-color: #ffffff;
-    width: 15px;
-    height: 15px;
-  }
+  .check input { accent-color: var(--ink); width: 13px; height: 13px; }
 
-  /* Кастомный инпут файла */
-  .file-box {
-    border: 1px dashed var(--border);
-    background: #000000;
-    border-radius: 12px;
-    padding: 12px 14px;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-  }
+  .btn-row .icon-btn { width: 31px; height: 31px; flex-basis: 31px; border-radius: 9px; }
 
-  .file-box input[type="file"] {
-    font-size: 11px;
-    color: var(--muted);
+  .add-btn-row {
     width: 100%;
+    margin-top: 4px;
+    border-style: dashed;
   }
 
-  .file-box input[type="file"]::file-selector-button {
-    background: var(--white);
-    color: #000000;
-    border: none;
-    padding: 7px 12px;
-    border-radius: 8px;
-    font-family: 'Unbounded', sans-serif;
-    font-size: 11px;
-    font-weight: 600;
-    margin-right: 12px;
-    cursor: pointer;
+  /* ============ PREVIEW ============ */
+  .preview-col {
+    position: sticky;
+    top: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+    padding: 15px;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: rgba(0, 0, 0, 0.2);
   }
 
-  /* Превью */
-  .preview-box {
-    margin-top: 20px;
-    border: 1px solid var(--border);
-    background: #000000;
-    border-radius: 14px;
-    padding: 16px;
-  }
-
-  .preview-caption {
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--muted);
-    margin-bottom: 12px;
+  .preview-label {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 7px;
+    font-size: 7.5px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--dim);
   }
 
-  .tg-msg {
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: 14px 14px 14px 4px;
-    padding: 13px 15px;
-    font-size: 13px;
-    line-height: 1.5;
+  .preview-label svg { width: 12px; height: 12px; }
+
+  .tg {
+    background: #0e0e0e;
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 15px 15px 15px 4px;
+    padding: 12px 13px;
+    min-height: 64px;
+  }
+
+  .tg__media {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    margin-bottom: 8px;
+    padding: 8px 9px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 9px;
+    background: rgba(255, 255, 255, 0.03);
+    font-size: 8.5px;
+    color: var(--ink-soft);
+  }
+
+  .tg__media svg { width: 13px; height: 13px; color: var(--muted); }
+
+  .tg__text {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 12px;
+    line-height: 1.55;
+    color: #f1f1f1;
     white-space: pre-wrap;
     word-break: break-word;
   }
 
-  .tg-msg a {
-    color: #ffffff;
-    text-decoration: underline;
-  }
+  .tg__text a { color: #9ecbff; text-decoration: underline; }
+  .tg__text code { background: rgba(255, 255, 255, 0.08); padding: 2px 5px; border-radius: 5px; font-size: 10.5px; }
+  .tg__text b, .tg__text strong { font-weight: 700; }
+  .tg__text i, .tg__text em { font-style: italic; }
 
-  .tg-msg code {
-    background: #000000;
-    border: 1px solid var(--border);
-    padding: 2px 6px;
-    border-radius: 6px;
-    font-family: monospace;
-  }
+  .tg__kb { display: flex; flex-direction: column; gap: 5px; margin-top: 7px; }
+  .tg__kb-line { display: flex; gap: 5px; }
 
-  .tg-kb {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin-top: 8px;
-  }
-
-  .tg-kb-line {
-    display: flex;
-    gap: 6px;
-  }
-
-  .tg-kb-item {
+  .tg__kb-item {
     flex: 1;
-    background: var(--white);
-    color: #000000;
-    text-align: center;
-    padding: 9px 10px;
-    border-radius: 9px;
-    font-size: 11px;
-    font-weight: 600;
     display: flex;
     align-items: center;
     justify-content: center;
     gap: 5px;
+    padding: 8px 8px;
+    border-radius: 8px;
+    background: var(--ink);
+    color: #050505;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 10.5px;
+    font-weight: 600;
+    text-align: center;
+    overflow: hidden;
   }
 
-  /* Список */
-  .search-wrap {
-    position: relative;
-    margin-bottom: 16px;
-  }
+  .tg__kb-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  .search-wrap i {
-    position: absolute;
-    left: 14px;
-    top: 50%;
-    transform: translateY(-50%);
-    color: var(--muted);
-    width: 16px;
-    height: 16px;
-  }
-
-  .search-wrap input {
-    padding-left: 40px;
-  }
-
-  .list-scroll {
+  .preview-meta {
     display: flex;
-    flex-direction: column;
-    gap: 12px;
-    max-height: 780px;
-    overflow-y: auto;
-    padding-right: 4px;
-  }
-
-  .list-scroll::-webkit-scrollbar {
-    width: 4px;
-  }
-
-  .list-scroll::-webkit-scrollbar-thumb {
-    background: #333333;
-    border-radius: 4px;
-  }
-
-  .item-card {
-    background: #000000;
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 16px;
-    transition: border-color 0.15s;
-  }
-
-  .item-card:hover {
-    border-color: var(--border-hover);
-  }
-
-  .item-head {
-    display: flex;
+    align-items: center;
     justify-content: space-between;
-    align-items: center;
-    gap: 10px;
+    gap: 8px;
+    padding-top: 2px;
+    font-size: 8px;
+    color: var(--dim);
   }
 
-  .item-phrase {
-    font-size: 14px;
-    font-weight: 600;
-    color: #ffffff;
-  }
-
-  .type-pill {
-    font-size: 10px;
-    font-weight: 600;
-    text-transform: uppercase;
-    padding: 3px 8px;
-    border-radius: 6px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    color: var(--muted);
-  }
-
-  .item-text {
-    margin-top: 10px;
-    font-size: 12.5px;
-    color: #bbbbbb;
-    line-height: 1.5;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-
-  .item-chips {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    margin-top: 12px;
-  }
-
-  .item-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    font-size: 11px;
-    padding: 4px 9px;
-    border-radius: 7px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    color: #ffffff;
-  }
-
-  /* Уведомление */
+  /* ============ TOAST ============ */
   #toast {
     position: fixed;
-    bottom: 24px;
-    right: 24px;
-    z-index: 200;
-    background: var(--white);
-    color: #000000;
-    padding: 13px 18px;
-    border-radius: 12px;
-    font-size: 12px;
-    font-weight: 600;
+    right: 20px;
+    bottom: 20px;
+    z-index: 300;
     display: flex;
     align-items: center;
     gap: 8px;
-    transform: translateY(120px);
+    max-width: min(360px, calc(100vw - 40px));
+    padding: 12px 15px;
+    border-radius: 12px;
+    background: var(--ink);
+    color: #050505;
+    font-size: 9.5px;
+    font-weight: 500;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+    transform: translateY(120%);
     opacity: 0;
-    transition: all 0.25s ease;
+    transition: transform 0.28s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.28s;
   }
 
-  #toast.show {
-    transform: translateY(0);
-    opacity: 1;
+  #toast svg { width: 15px; height: 15px; flex: 0 0 15px; }
+
+  #toast.show { transform: translateY(0); opacity: 1; }
+
+  #toast.error { background: var(--danger); color: #2a0507; }
+
+  svg.lucide { width: 15px; height: 15px; stroke-width: 1.8; flex-shrink: 0; }
+
+  /* ============ SCROLLBARS ============ */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.12); border-radius: 99px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.2); }
+
+  /* ============ ANIMATIONS ============ */
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(14px) scale(0.985); }
+    to { opacity: 1; transform: none; }
   }
 
-  #toast.error {
-    background: var(--danger);
-    color: #ffffff;
+  @keyframes shake {
+    0%, 100% { transform: translateX(0); }
+    25% { transform: translateX(-7px); }
+    75% { transform: translateX(7px); }
   }
 
-  svg.lucide {
-    width: 15px;
-    height: 15px;
-    stroke-width: 2;
-    flex-shrink: 0;
+  /* ============ RESPONSIVE ============ */
+  @media (max-width: 1180px) {
+    .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .project-grid { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+  }
+
+  @media (max-width: 980px) {
+    .app { grid-template-columns: 1fr; }
+    .sidebar {
+      position: fixed;
+      top: 12px;
+      bottom: 12px;
+      left: 12px;
+      z-index: 120;
+      width: min(290px, calc(100vw - 40px));
+      height: auto;
+      transform: translateX(calc(-100% - 20px));
+      transition: transform 0.28s cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+    .sidebar.is-open { transform: none; }
+    .topbar__burger, .sidebar__close { display: inline-flex; }
+    .app-scrim {
+      position: fixed;
+      inset: 0;
+      z-index: 110;
+      background: rgba(0, 0, 0, 0.65);
+      backdrop-filter: blur(4px);
+      opacity: 0;
+      pointer-events: none;
+      transition: 0.25s;
+    }
+    .app-scrim.is-open { opacity: 1; pointer-events: auto; }
+    .grid-2 { grid-template-columns: 1fr; }
+    .editor-grid { grid-template-columns: 1fr; }
+    .preview-col { position: static; }
+  }
+
+  @media (max-width: 620px) {
+    .app { padding: 8px; gap: 8px; }
+    .topbar { top: 8px; }
+    .page-head { padding-top: 6px; }
+    .metric-grid { grid-template-columns: 1fr 1fr; gap: 7px; }
+    .metric { padding: 13px; }
+    .metric__value { font-size: 26px; }
+    .metric__top { margin-bottom: 13px; }
+    .project-grid { grid-template-columns: 1fr; }
+    .modal { padding: 8px; }
+    .modal__card { max-height: calc(100vh - 16px); border-radius: 20px; }
+    .modal__head, .modal__body, .modal__foot { padding-left: 15px; padding-right: 15px; }
+    .btn-row { grid-template-columns: 1fr 1fr auto; }
+    .btn-row .check { grid-column: 1 / -1; justify-self: start; }
+    .topbar__count, .topbar__right .pill { display: none; }
   }
 </style>
 </head>
-<body>
+<body class="locked">
+<div class="liquid" aria-hidden="true">
+  <span class="liquid__blob liquid__blob--1"></span>
+  <span class="liquid__blob liquid__blob--2"></span>
+</div>
+<div class="grain" aria-hidden="true"></div>
+<div class="app-scrim" id="app_scrim" onclick="toggleSidebar(false)"></div>
 
-<!-- Экран авторизации -->
-<div id="auth_overlay">
-  <div class="auth-box">
-    <div class="auth-icon">
-      <i data-lucide="lock" style="width: 22px; height: 22px;"></i>
+<!-- ЭКРАН ВХОДА -->
+<div class="auth" id="auth_overlay">
+  <div class="auth__card glass" id="auth_card">
+    <div class="auth__mark">
+      <i data-lucide="terminal-square" style="width:23px;height:23px;"></i>
     </div>
-    <h2 style="margin: 0 0 8px 0; font-size: 18px; font-weight: 700;">ДОСТУП В ПАНЕЛЬ</h2>
-    <p style="margin: 0 0 22px 0; font-size: 12px; color: var(--muted); line-height: 1.5;">
-      Введите пароль из переменной WEB_PASSWORD
-    </p>
-    <input type="password" id="pass_input" placeholder="Пароль" onkeydown="if(event.key==='Enter') login()">
-    <button class="btn-white" style="width: 100%; margin-top: 14px;" onclick="login()">
+    <span class="eyebrow">Trigger Studio</span>
+    <h2>Доступ в панель</h2>
+    <p>Введите пароль из переменной <code>WEB_PASSWORD</code> на Render. Пароль сохранится в этом браузере.</p>
+    <label class="field" style="margin-bottom:12px;">
+      <span class="field__label">Пароль</span>
+      <span class="input-wrap">
+        <i data-lucide="lock"></i>
+        <input type="password" id="pass_input" placeholder="••••••••" autocomplete="current-password" onkeydown="if(event.key==='Enter') login()">
+      </span>
+    </label>
+    <button class="btn btn--light btn--block" id="login_btn" onclick="login()">
       <span>Войти</span>
       <i data-lucide="arrow-right"></i>
     </button>
+    <span class="auth__hint"><i data-lucide="database"></i> Upstash Redis · Render</span>
   </div>
 </div>
 
-<div class="wrapper">
-  <header class="header">
-    <div class="brand">
-      <div class="brand-mark">
-        <i data-lucide="terminal" style="width: 20px; height: 20px;"></i>
+<!-- ПРИЛОЖЕНИЕ -->
+<div class="app" id="app">
+  <aside class="sidebar glass" id="sidebar" aria-label="Навигация">
+    <div class="sidebar__top">
+      <div class="brand">
+        <span class="brand__mark">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4 7h16M4 12h10M4 17h13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <circle cx="19" cy="19" r="2.6" fill="currentColor" stroke="none"/>
+          </svg>
+        </span>
+        <span class="brand__text">
+          <b>TRIGGER</b>
+          <span>STUDIO</span>
+        </span>
       </div>
-      <div>
-        <h1>TRIGGER STUDIO</h1>
-        <p>RENDER + UPSTASH REDIS</p>
-      </div>
-    </div>
-
-    <div class="header-right">
-      <div class="stat-tag">
-        <span class="status-dot"></span>
-        <span>БАЗА: <strong id="total_count">0</strong></span>
-      </div>
-      <button class="btn-outline" onclick="logout()" title="Выйти">
-        <i data-lucide="log-out"></i>
-        <span>Выход</span>
+      <button class="icon-btn sidebar__close" type="button" onclick="toggleSidebar(false)" aria-label="Закрыть меню">
+        <i data-lucide="x"></i>
       </button>
     </div>
-  </header>
 
-  <div class="grid">
-    <!-- Левая колонка: редактор -->
-    <section class="panel">
-      <div class="panel-head">
-        <h2 class="panel-title">
-          <i data-lucide="plus-square"></i>
-          <span id="form_title">НОВАЯ ЗАГОТОВКА</span>
-        </h2>
-        <button class="btn-outline" onclick="resetForm()">
-          <i data-lucide="rotate-ccw"></i>
-          <span>Сброс</span>
-        </button>
-      </div>
+    <nav class="nav">
+      <span class="nav__group">Панель</span>
+      <button class="nav__link is-active" type="button" data-view="overview">
+        <i data-lucide="layout-dashboard"></i>
+        <span>Обзор</span>
+        <span class="nav__badge" id="nav_total">0</span>
+      </button>
+      <button class="nav__link" type="button" data-view="triggers">
+        <i data-lucide="layers"></i>
+        <span>Заготовки</span>
+        <span class="nav__badge" id="nav_total_2">0</span>
+      </button>
 
-      <label>Фраза-триггер (регистр не важен)</label>
-      <input type="text" id="phrase" placeholder="Например: как скачать">
-
-      <label>Текст ответа (HTML)</label>
-      <div class="toolbar">
-        <button type="button" class="tool-btn" onclick="wrapTag('b')"><i data-lucide="bold"></i> B</button>
-        <button type="button" class="tool-btn" onclick="wrapTag('i')"><i data-lucide="italic"></i> I</button>
-        <button type="button" class="tool-btn" onclick="wrapTag('u')"><i data-lucide="underline"></i> U</button>
-        <button type="button" class="tool-btn" onclick="wrapTag('s')"><i data-lucide="strikethrough"></i> S</button>
-        <button type="button" class="tool-btn" onclick="wrapTag('code')"><i data-lucide="code"></i> Code</button>
-        <button type="button" class="tool-btn" onclick="wrapTag('tg-spoiler')"><i data-lucide="eye-off"></i> Спойлер</button>
-        <button type="button" class="tool-btn" onclick="insertLink()"><i data-lucide="link"></i> Ссылка</button>
-      </div>
-      <textarea id="html_text" placeholder="Введите текст ответа..." oninput="updatePreview()"></textarea>
-
-      <label>Медиафайл (фото, видео, гиф, документ)</label>
-      <div class="file-box">
-        <input type="file" id="media_file" onchange="updatePreview()">
-      </div>
-      <input type="hidden" id="existing_media_type" value="text">
-      <input type="hidden" id="existing_file_id" value="">
-
-      <label>Кнопки под сообщением</label>
-      <div id="buttons_box"></div>
-      <button type="button" class="btn-outline" style="width: 100%; margin-top: 10px;" onclick="addBtnRow()">
+      <span class="nav__group">Действия</span>
+      <button class="nav__link" type="button" onclick="openEditor()">
         <i data-lucide="plus"></i>
-        <span>Добавить кнопку</span>
+        <span>Новая заготовка</span>
       </button>
+      <button class="nav__link" type="button" onclick="exportBackup()">
+        <i data-lucide="download"></i>
+        <span>Скачать бэкап</span>
+      </button>
+      <button class="nav__link" type="button" onclick="loadTriggers(true)">
+        <i data-lucide="refresh-cw"></i>
+        <span>Обновить базу</span>
+      </button>
+    </nav>
 
-      <div class="preview-box">
-        <div class="preview-caption">
-          <i data-lucide="eye"></i>
-          <span>Предпросмотр сообщения</span>
+    <div class="sidebar__foot">
+      <div class="storage">
+        <span class="storage__dot"></span>
+        <div>
+          <b>Upstash Redis</b>
+          <span>синхронизировано</span>
         </div>
-        <div class="tg-msg" id="preview_bubble">
-          <span style="color: var(--muted);">Текст ответа появится здесь...</span>
-        </div>
-        <div class="tg-kb" id="preview_kb"></div>
+        <i data-lucide="database"></i>
       </div>
-
-      <button type="button" class="btn-white" id="save_btn" style="width: 100%; margin-top: 20px;" onclick="saveTrigger()">
-        <i data-lucide="check"></i>
-        <span>Сохранить заготовку</span>
+      <button class="side-logout" type="button" onclick="logout()">
+        <i data-lucide="log-out"></i>
+        <span>Выйти из панели</span>
       </button>
-    </section>
+    </div>
+  </aside>
 
-    <!-- Правая колонка: список -->
-    <section class="panel">
-      <div class="panel-head">
-        <h2 class="panel-title">
-          <i data-lucide="layers"></i>
-          <span>СПИСОК ФРАЗ</span>
-        </h2>
-        <button class="btn-outline" onclick="loadTriggers()">
+  <div class="main">
+    <header class="topbar glass">
+      <button class="icon-btn topbar__burger" type="button" onclick="toggleSidebar(true)" aria-label="Открыть меню">
+        <i data-lucide="menu"></i>
+      </button>
+      <label class="topbar__search">
+        <i data-lucide="search"></i>
+        <input type="search" id="top_search" placeholder="Поиск по фразам, тексту и regex" aria-label="Поиск" oninput="onSearch(this.value)">
+      </label>
+      <div class="topbar__right">
+        <span class="pill pill--live"><i></i> Live</span>
+        <span class="topbar__count"><b id="top_total">0</b> фраз</span>
+        <button class="icon-btn" type="button" onclick="loadTriggers(true)" title="Обновить">
           <i data-lucide="refresh-cw"></i>
-          <span>Обновить</span>
         </button>
       </div>
+    </header>
 
-      <div class="search-wrap">
-        <i data-lucide="search"></i>
-        <input type="text" id="search_input" placeholder="Поиск по фразе или тексту..." oninput="renderList()">
+    <!-- ОБЗОР -->
+    <section class="view is-active" data-view="overview">
+      <div class="page-head">
+        <div>
+          <span class="eyebrow">Dashboard</span>
+          <h1>Обзор</h1>
+          <p>Все заготовки, типы совпадений и состояние базы. Бот отвечает в группах автоматически.</p>
+        </div>
+        <div class="page-head__actions">
+          <button class="btn btn--glass btn--sm" type="button" onclick="loadTriggers(true)">
+            <i data-lucide="refresh-cw"></i>
+            <span>Обновить</span>
+          </button>
+          <button class="btn btn--light btn--sm" type="button" onclick="openEditor()">
+            <span>Новая заготовка</span>
+            <i data-lucide="plus"></i>
+          </button>
+        </div>
       </div>
 
-      <div class="list-scroll" id="list_box"></div>
+      <div class="metric-grid">
+        <article class="metric glass">
+          <div class="metric__top">
+            <span class="metric__label">Всего фраз</span>
+            <span class="metric__icon"><i data-lucide="layers"></i></span>
+          </div>
+          <div class="metric__value" id="metric_total">0</div>
+          <div class="metric__foot"><b id="metric_total_media">0</b> с медиа</div>
+        </article>
+        <article class="metric glass metric--green">
+          <div class="metric__top">
+            <span class="metric__label">Содержит</span>
+            <span class="metric__icon"><i data-lucide="text-search"></i></span>
+          </div>
+          <div class="metric__value" id="metric_contains">0</div>
+          <div class="metric__foot">фраза внутри сообщения</div>
+        </article>
+        <article class="metric glass metric--violet">
+          <div class="metric__top">
+            <span class="metric__label">Regex</span>
+            <span class="metric__icon"><i data-lucide="regex"></i></span>
+          </div>
+          <div class="metric__value" id="metric_regex">0</div>
+          <div class="metric__foot">шаблоны и старые записи</div>
+        </article>
+        <article class="metric glass">
+          <div class="metric__top">
+            <span class="metric__label">Кнопок</span>
+            <span class="metric__icon"><i data-lucide="mouse-pointer-click"></i></span>
+          </div>
+          <div class="metric__value" id="metric_buttons">0</div>
+          <div class="metric__foot">во всех заготовках</div>
+        </article>
+      </div>
+
+      <div class="grid-2">
+        <section class="panel glass">
+          <div class="panel__head">
+            <div>
+              <div class="panel__title">Типы совпадений</div>
+              <div class="panel__sub">Как бот находит фразы в сообщениях</div>
+            </div>
+            <span class="pill"><i></i> Live</span>
+          </div>
+          <div class="bars" id="type_bars"></div>
+        </section>
+
+        <section class="panel glass">
+          <div class="panel__head">
+            <div>
+              <div class="panel__title">Состояние базы</div>
+              <div class="panel__sub">Данные хранятся в Upstash Redis</div>
+            </div>
+            <span class="pill pill--media">Render</span>
+          </div>
+          <div class="stat-list">
+            <div class="stat-row"><span>Фраз в базе</span><b id="stat_phrases">0</b></div>
+            <div class="stat-row"><span>С медиафайлом</span><b id="stat_media">0</b></div>
+            <div class="stat-row"><span>Кнопок</span><b id="stat_buttons">0</b></div>
+            <div class="stat-row"><span>Подключение</span><span class="ok"><i></i> Online</span></div>
+          </div>
+          <button class="btn btn--glass btn--sm btn--block" type="button" style="margin-top:14px;" onclick="exportBackup()">
+            <i data-lucide="download"></i>
+            <span>Скачать JSON-бэкап</span>
+          </button>
+        </section>
+      </div>
+
+      <div class="panel__head page-subhead">
+        <div class="panel__title">Заготовки</div>
+        <button class="btn btn--ghost btn--xs" type="button" onclick="switchView('triggers')">Все заготовки</button>
+      </div>
+      <div class="project-grid" id="overview_list"></div>
     </section>
+
+    <!-- ЗАГОТОВКИ -->
+    <section class="view" data-view="triggers">
+      <div class="page-head">
+        <div>
+          <span class="eyebrow">Database</span>
+          <h1>Заготовки</h1>
+          <p>Ответы, которые бот отправляет в группах. Нажмите на карточку, чтобы изменить текст, медиа или тип совпадения.</p>
+        </div>
+        <div class="page-head__actions">
+          <button class="btn btn--light btn--sm" type="button" onclick="openEditor()">
+            <span>Новая заготовка</span>
+            <i data-lucide="plus"></i>
+          </button>
+        </div>
+      </div>
+
+      <div class="filters">
+        <div class="chips" id="type_filters">
+          <button class="chip is-active" type="button" data-type="all">Все <b>0</b></button>
+          <button class="chip" type="button" data-type="exact">Точные <b>0</b></button>
+          <button class="chip" type="button" data-type="contains">Содержит <b>0</b></button>
+          <button class="chip" type="button" data-type="regex">Regex <b>0</b></button>
+        </div>
+        <span class="pill" id="shown_count">0 из 0</span>
+      </div>
+
+      <section class="panel glass list-panel">
+        <div class="project-grid" id="triggers_grid"></div>
+        <div class="empty" id="triggers_empty" hidden>
+          <span class="empty__icon"><i data-lucide="inbox"></i></span>
+          <b>Ничего не найдено</b>
+          <span>Измените поиск, выберите другой тип или добавьте новую заготовку.</span>
+          <button class="btn btn--light btn--sm" type="button" onclick="openEditor()">
+            <i data-lucide="plus"></i>
+            <span>Добавить заготовку</span>
+          </button>
+        </div>
+      </section>
+    </section>
+  </div>
+</div>
+
+<!-- РЕДАКТОР -->
+<div class="modal" id="editor_modal" aria-hidden="true">
+  <div class="modal__backdrop" onclick="closeEditor()"></div>
+  <div class="modal__card glass" role="dialog" aria-modal="true" aria-labelledby="editor_title">
+    <div class="modal__head">
+      <div>
+        <span class="eyebrow" id="editor_eyebrow">New trigger</span>
+        <h2 id="editor_title">Новая заготовка</h2>
+      </div>
+      <button class="icon-btn" type="button" onclick="closeEditor()" aria-label="Закрыть">
+        <i data-lucide="x"></i>
+      </button>
+    </div>
+
+    <div class="modal__body">
+      <div class="editor-grid">
+        <div>
+          <label class="field">
+            <span class="field__label">Фраза-триггер</span>
+            <span class="input-wrap">
+              <i data-lucide="message-square"></i>
+              <input type="text" id="phrase" placeholder="Например: как скачать" autocomplete="off" spellcheck="false" oninput="onPhraseInput()">
+            </span>
+            <span class="field__hint" id="phrase_hint">Регистр букв не важен.</span>
+          </label>
+
+          <label class="field" id="pattern_field" hidden>
+            <span class="field__label">Regex-шаблон</span>
+            <span class="input-wrap">
+              <i data-lucide="regex"></i>
+              <input type="text" id="regex_pattern" placeholder="(скачать|где)\s+игру" autocomplete="off" spellcheck="false">
+            </span>
+            <span class="field__hint">Бот ищет по этому шаблону. Фраза выше — название записи в панели.</span>
+          </label>
+
+          <div class="field">
+            <span class="field__label">Тип совпадения</span>
+            <div class="segmented" id="type_segmented">
+              <button type="button" data-type="exact" onclick="setType('exact')">Точное</button>
+              <button type="button" data-type="contains" onclick="setType('contains')">Содержит</button>
+              <button type="button" data-type="regex" onclick="setType('regex')">Regex</button>
+            </div>
+            <span class="field__hint" id="type_hint">Бот ответит, если фраза встретится внутри сообщения.</span>
+          </div>
+
+          <label class="field">
+            <span class="field__label">Текст ответа (HTML)</span>
+            <div class="toolbar">
+              <button type="button" class="tool-btn" onclick="wrapTag('b')" title="Жирный"><i data-lucide="bold"></i> B</button>
+              <button type="button" class="tool-btn" onclick="wrapTag('i')" title="Курсив"><i data-lucide="italic"></i> I</button>
+              <button type="button" class="tool-btn" onclick="wrapTag('u')" title="Подчёркнутый"><i data-lucide="underline"></i> U</button>
+              <button type="button" class="tool-btn" onclick="wrapTag('s')" title="Зачёркнутый"><i data-lucide="strikethrough"></i> S</button>
+              <button type="button" class="tool-btn" onclick="wrapTag('code')" title="Код"><i data-lucide="code"></i> Code</button>
+              <button type="button" class="tool-btn" onclick="wrapTag('tg-spoiler')" title="Спойлер"><i data-lucide="eye-off"></i> Спойлер</button>
+              <button type="button" class="tool-btn" onclick="insertLink()" title="Ссылка"><i data-lucide="link"></i> Ссылка</button>
+            </div>
+            <textarea id="html_text" placeholder="Введите текст ответа..." oninput="updatePreview()"></textarea>
+          </label>
+
+          <div class="field">
+            <span class="field__label">Медиафайл</span>
+            <div class="dropzone" id="dropzone">
+              <i data-lucide="upload-cloud"></i>
+              <b id="file_name">Файл не выбран</b>
+              <span>фото, видео, гиф или документ · до 50 МБ</span>
+              <input type="file" id="media_file" onchange="onFileChange()">
+            </div>
+            <div class="media-existing" id="existing_media_note" hidden>
+              <span><i data-lucide="paperclip"></i> В записи: <b id="existing_media_label"></b></span>
+              <button type="button" onclick="removeExistingMedia()">Убрать</button>
+            </div>
+            <input type="hidden" id="existing_media_type" value="text">
+            <input type="hidden" id="existing_file_id" value="">
+          </div>
+
+          <div class="field" style="margin-bottom:0;">
+            <span class="field__label">Кнопки под сообщением</span>
+            <div id="buttons_box"></div>
+            <button type="button" class="btn btn--glass btn--sm add-btn-row" onclick="addBtnRow()">
+              <i data-lucide="plus"></i>
+              <span>Добавить кнопку</span>
+            </button>
+          </div>
+        </div>
+
+        <aside class="preview-col">
+          <div class="preview-label"><i data-lucide="eye"></i> Предпросмотр сообщения</div>
+          <div class="tg">
+            <div class="tg__media" id="preview_media" hidden>
+              <i data-lucide="paperclip"></i>
+              <span id="preview_media_text">file</span>
+            </div>
+            <div class="tg__text" id="preview_bubble"><span class="muted">Текст ответа появится здесь...</span></div>
+          </div>
+          <div class="tg__kb" id="preview_kb"></div>
+          <div class="preview-meta">
+            <span id="preview_type">Содержит</span>
+            <span id="preview_buttons">0 кнопок</span>
+          </div>
+        </aside>
+      </div>
+    </div>
+
+    <div class="modal__foot">
+      <button class="btn btn--glass" type="button" onclick="closeEditor()">Отмена</button>
+      <button class="btn btn--light" type="button" id="save_btn" onclick="saveTrigger()">
+        <span>Сохранить</span>
+        <i data-lucide="check"></i>
+      </button>
+    </div>
   </div>
 </div>
 
 <div id="toast">
   <i data-lucide="check-circle-2"></i>
-  <span id="toast_text">Сохранено</span>
+  <span id="toast_text">Готово</span>
 </div>
 
 <script>
 let currentDb = {};
 let authPass = localStorage.getItem('tg_admin_pass') || '';
+let currentView = 'overview';
+let activeType = 'all';
+let searchQuery = '';
+let selectedType = 'contains';
+let editingOriginal = '';
+let existingMediaType = 'text';
+let existingFileId = '';
+let toastTimer = null;
 
-function refreshIcons() {
-  if (window.lucide) {
-    lucide.createIcons();
+const TYPE_ORDER = ['exact', 'contains', 'regex'];
+const TYPE_META = {
+  exact: {
+    label: 'Точное',
+    hint: 'Сообщение должно полностью совпасть с фразой. Регистр букв не важен.',
+    phraseHint: 'Например: как скачать'
+  },
+  contains: {
+    label: 'Содержит',
+    hint: 'Бот ответит, если фраза встретится внутри сообщения. Регистр букв не важен.',
+    phraseHint: 'Например: как скачать'
+  },
+  regex: {
+    label: 'Regex',
+    hint: 'Регулярное выражение, поиск без учёта регистра. Например: (скачать|где)\\s+игру',
+    phraseHint: 'Например: (скачать|где)\\s+игру'
   }
+};
+
+const MEDIA_LABELS = {
+  text: 'Текст',
+  photo: 'Фото',
+  video: 'Видео',
+  animation: 'Гифка',
+  document: 'Документ',
+  sticker: 'Стикер',
+  voice: 'Голосовое',
+  video_note: 'Кружок'
+};
+
+const ICONS = {
+  'search': '<circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/>',
+  'terminal-square': '<rect x="3" y="3" width="18" height="18" rx="4"/><path d="m7 9 3 3-3 3"/><path d="M13 15h4"/>',
+  'lock': '<rect x="4" y="10" width="16" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+  'arrow-right': '<path d="M5 12h14"/><path d="m13 6 6 6-6 6"/>',
+  'arrow-up-right': '<path d="M7 17 17 7"/><path d="M7 7h10v10"/>',
+  'database': '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/>',
+  'x': '<path d="M6 6l12 12M18 6 6 18"/>',
+  'layout-dashboard': '<rect x="3" y="3" width="7" height="9" rx="2"/><rect x="14" y="3" width="7" height="5" rx="2"/><rect x="14" y="12" width="7" height="9" rx="2"/><rect x="3" y="16" width="7" height="5" rx="2"/>',
+  'layers': '<path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/>',
+  'plus': '<path d="M12 5v14M5 12h14"/>',
+  'download': '<path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/>',
+  'refresh-cw': '<path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/><path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/>',
+  'log-out': '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/>',
+  'menu': '<path d="M3 6h18M3 12h18M3 18h18"/>',
+  'text-search': '<path d="M21 6H3"/><path d="M10 12H3"/><path d="M10 18H3"/><circle cx="17" cy="15" r="3"/><path d="m21 19-1.5-1.5"/>',
+  'regex': '<path d="M17 3v10"/><path d="m12.7 5.5 8.6 5"/><path d="m21.3 5.5-8.6 5"/><circle cx="5" cy="19" r="2"/>',
+  'mouse-pointer-click': '<path d="m9 9 5 12 1.8-5.2L21 14Z"/><path d="M7.2 2.2 8 5.1"/><path d="m5.1 8-2.9-.8"/><path d="M14 4.1 12 6"/><path d="m6 12-1.9 2"/>',
+  'bold': '<path d="M6 4h8a4 4 0 0 1 0 8H6z"/><path d="M6 12h9a4 4 0 0 1 0 8H6z"/>',
+  'check': '<path d="m4 12 5 5L20 6"/>',
+  'check-circle-2': '<circle cx="12" cy="12" r="9"/><path d="m8.5 12 2.5 2.5L16 9"/>',
+  'code': '<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/>',
+  'eye': '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/>',
+  'eye-off': '<path d="m3 3 18 18"/><path d="M10.6 5.2A10.5 10.5 0 0 1 12 5c6.5 0 10 7 10 7a18 18 0 0 1-3.1 4.1"/><path d="M6.6 6.6C3.7 8.4 2 12 2 12s3.5 7 10 7a10.4 10.4 0 0 0 5.4-1.6"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
+  'inbox': '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="m5.5 5.1-3 6.9a2 2 0 0 0-.2.8V18a2 2 0 0 0 2 2h15.4a2 2 0 0 0 2-2v-5.2a2 2 0 0 0-.2-.8l-3-6.9A2 2 0 0 0 16.7 4H7.3a2 2 0 0 0-1.8 1.1Z"/>',
+  'italic': '<path d="M19 4h-9M14 20H5M15 4 9 20"/>',
+  'link': '<path d="M10 13a5 5 0 0 0 7.1 0l2.9-2.9a5 5 0 0 0-7.1-7.1L11 4.9"/><path d="M14 11a5 5 0 0 0-7.1 0L4 13.9a5 5 0 0 0 7.1 7.1L13 19.1"/>',
+  'link-2': '<path d="M9 17H7a5 5 0 0 1 0-10h2"/><path d="M15 7h2a5 5 0 0 1 0 10h-2"/><path d="M8 12h8"/>',
+  'message-square': '<path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4Z"/>',
+  'paperclip': '<path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l8.9-8.9a4 4 0 0 1 5.7 5.7l-8.9 8.9a2 2 0 0 1-2.8-2.8l8.2-8.2"/>',
+  'pencil': '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+  'strikethrough': '<path d="M16 4H9a3 3 0 0 0-2.8 4"/><path d="M14 12a4 4 0 0 1 0 8H6"/><path d="M4 12h16"/>',
+  'underline': '<path d="M6 4v6a6 6 0 0 0 12 0V4"/><path d="M4 20h16"/>',
+  'upload-cloud': '<path d="M16 16l-4-4-4 4"/><path d="M12 12v9"/><path d="M20.4 18.4A5 5 0 0 0 18 9h-1.3A8 8 0 1 0 4 17.3"/>',
+  'trash-2': '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/>'
+};
+
+function iconSvg(name) {
+  const inner = ICONS[name] || ICONS['search'];
+  return '<svg class="lucide" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + inner + '</svg>';
 }
 
-function showToast(msg, isError = false) {
-  const t = document.getElementById('toast');
-  const txt = document.getElementById('toast_text');
-  txt.textContent = msg;
-  t.className = isError ? 'show error' : 'show';
-  setTimeout(() => { t.className = ''; }, 2600);
+function refreshIcons(root) {
+  const scope = root || document;
+  scope.querySelectorAll('i[data-lucide]').forEach(el => {
+    const template = document.createElement('template');
+    template.innerHTML = iconSvg(el.getAttribute('data-lucide')).trim();
+    el.replaceWith(template.content.firstChild);
+  });
+}
+
+function escapeHtml(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value).replace(/`/g, '&#096;');
+}
+
+function plainText(html) {
+  const tmp = document.createElement('div');
+  tmp.innerHTML = String(html || '');
+  return (tmp.textContent || tmp.innerText || '').replace(/\s+/g, ' ').trim();
+}
+
+function normType(item) {
+  const type = item && item.match_type;
+  return TYPE_ORDER.includes(type) ? type : 'regex';
+}
+
+function typeLabel(type) {
+  return (TYPE_META[type] || TYPE_META.regex).label;
+}
+
+function mediaLabel(type) {
+  return MEDIA_LABELS[type] || type || 'Текст';
+}
+
+function showToast(message, isError) {
+  const toast = document.getElementById('toast');
+  document.getElementById('toast_text').textContent = message;
+  toast.className = isError ? 'show error' : 'show';
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { toast.className = ''; }, 3200);
+}
+
+function lockPanel() {
+  document.body.classList.add('locked');
+  document.getElementById('auth_overlay').style.display = 'flex';
+  setTimeout(() => {
+    const input = document.getElementById('pass_input');
+    if (input) input.focus();
+  }, 80);
+}
+
+function unlockPanel() {
+  document.body.classList.remove('locked');
+  document.getElementById('auth_overlay').style.display = 'none';
 }
 
 async function login() {
-  const val = document.getElementById('pass_input').value.trim();
-  if (!val) return;
-  authPass = val;
-  const ok = await loadTriggers();
+  const input = document.getElementById('pass_input');
+  const value = input.value.trim();
+  if (!value) {
+    showToast('Введите пароль', true);
+    return;
+  }
+  authPass = value;
+  const btn = document.getElementById('login_btn');
+  btn.disabled = true;
+  const ok = await loadTriggers(true);
+  btn.disabled = false;
   if (ok) {
     localStorage.setItem('tg_admin_pass', authPass);
-    document.getElementById('auth_overlay').style.display = 'none';
+    unlockPanel();
+    showToast('Добро пожаловать');
   } else {
+    const card = document.getElementById('auth_card');
+    card.classList.remove('shake');
+    void card.offsetWidth;
+    card.classList.add('shake');
+    input.value = '';
+    input.focus();
     showToast('Неверный пароль', true);
   }
 }
 
 function logout() {
   localStorage.removeItem('tg_admin_pass');
+  authPass = '';
   location.reload();
+}
+
+async function apiFetch(url, options) {
+  const opts = options || {};
+  opts.headers = Object.assign({ 'X-Admin-Password': authPass }, opts.headers || {});
+  const res = await fetch(url, opts);
+  if (res.status === 401) {
+    lockPanel();
+    throw new Error('unauthorized');
+  }
+  return res;
+}
+
+async function loadTriggers(silent) {
+  try {
+    const res = await apiFetch('/api/triggers');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    currentDb = await res.json();
+    renderAll();
+    return true;
+  } catch (e) {
+    if (!silent) showToast('Не удалось загрузить базу', true);
+    return false;
+  }
+}
+
+function switchView(name) {
+  currentView = name;
+  document.querySelectorAll('.view').forEach(view => {
+    view.classList.toggle('is-active', view.dataset.view === name);
+  });
+  document.querySelectorAll('.nav__link[data-view]').forEach(link => {
+    link.classList.toggle('is-active', link.dataset.view === name);
+  });
+  toggleSidebar(false);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function toggleSidebar(open) {
+  const sidebar = document.getElementById('sidebar');
+  const scrim = document.getElementById('app_scrim');
+  const shouldOpen = typeof open === 'boolean' ? open : !sidebar.classList.contains('is-open');
+  sidebar.classList.toggle('is-open', shouldOpen);
+  scrim.classList.toggle('is-open', shouldOpen);
+}
+
+function onSearch(value) {
+  searchQuery = value.trim().toLowerCase();
+  if (currentView !== 'triggers') switchView('triggers');
+  renderTriggers();
+}
+
+function getItems() {
+  return Object.keys(currentDb).map(phrase => {
+    return Object.assign({ phrase: phrase }, currentDb[phrase]);
+  });
+}
+
+function typeCounts(items) {
+  const counts = { exact: 0, contains: 0, regex: 0 };
+  items.forEach(item => { counts[normType(item)] += 1; });
+  return counts;
+}
+
+function renderAll() {
+  const items = getItems();
+  const counts = typeCounts(items);
+  const total = items.length;
+  const media = items.filter(item => item.file_id && (item.media_type || 'text') !== 'text').length;
+  const buttons = items.reduce((sum, item) => {
+    return sum + (item.buttons || []).reduce((rowSum, row) => rowSum + row.length, 0);
+  }, 0);
+
+  document.getElementById('nav_total').textContent = total;
+  document.getElementById('nav_total_2').textContent = total;
+  document.getElementById('top_total').textContent = total;
+  document.getElementById('metric_total').textContent = total;
+  document.getElementById('metric_total_media').textContent = media;
+  document.getElementById('metric_contains').textContent = counts.contains;
+  document.getElementById('metric_regex').textContent = counts.regex;
+  document.getElementById('metric_buttons').textContent = buttons;
+  document.getElementById('stat_phrases').textContent = total;
+  document.getElementById('stat_media').textContent = media;
+  document.getElementById('stat_buttons').textContent = buttons;
+
+  renderBars(counts, total);
+  renderFilterCounts(counts);
+  renderOverview(items);
+  renderTriggers();
+  refreshIcons();
+}
+
+function renderBars(counts, total) {
+  const box = document.getElementById('type_bars');
+  box.innerHTML = TYPE_ORDER.map(type => {
+    const count = counts[type];
+    const percent = total ? Math.round((count / total) * 100) : 0;
+    return '<div class="bar-row">' +
+      '<div class="bar-row__top"><span>' + typeLabel(type) + '</span><b>' + count + ' · ' + percent + '%</b></div>' +
+      '<div class="bar bar--' + type + '"><i style="width:' + percent + '%"></i></div>' +
+      '</div>';
+  }).join('');
+}
+
+function renderFilterCounts(counts) {
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  document.querySelectorAll('#type_filters .chip').forEach(chip => {
+    const type = chip.dataset.type;
+    const value = type === 'all' ? total : counts[type];
+    const badge = chip.querySelector('b');
+    if (badge) badge.textContent = value;
+  });
+}
+
+function triggerCard(item, compact) {
+  const type = normType(item);
+  const phrase = item.phrase;
+  const text = plainText(item.html_text) || (item.file_id ? 'Только медиа, без текста' : 'Без текста');
+  const buttons = (item.buttons || []).flat();
+  const media = item.file_id && (item.media_type || 'text') !== 'text';
+  const pattern = type === 'regex' && item.pattern && item.pattern !== phrase ? item.pattern : '';
+
+  const chips = buttons.slice(0, compact ? 2 : 4).map(btn => {
+    return '<span class="chip-link"><i data-lucide="link-2"></i>' + escapeHtml(btn.text) + '</span>';
+  }).join('');
+
+  return '<article class="trigger glass">' +
+    '<div class="trigger__top">' +
+      '<div class="trigger__badges">' +
+        '<span class="pill pill--' + type + '">' + typeLabel(type) + '</span>' +
+        (media ? '<span class="pill pill--media">' + mediaLabel(item.media_type) + '</span>' : '') +
+      '</div>' +
+      '<div class="trigger__actions">' +
+        (compact ? '' : '<button class="icon-btn" type="button" data-edit="' + escapeAttr(phrase) + '" title="Изменить"><i data-lucide="pencil"></i></button>' +
+        '<button class="icon-btn icon-btn--danger" type="button" data-delete="' + escapeAttr(phrase) + '" title="Удалить"><i data-lucide="trash-2"></i></button>') +
+      '</div>' +
+    '</div>' +
+    '<h3 class="trigger__phrase">' + escapeHtml(phrase) + '</h3>' +
+    (pattern ? '<div class="trigger__pattern"><i data-lucide="regex"></i><span>' + escapeHtml(pattern) + '</span></div>' : '') +
+    '<p class="trigger__text">' + escapeHtml(text) + '</p>' +
+    (chips ? '<div class="trigger__chips">' + chips + (buttons.length > (compact ? 2 : 4) ? '<span class="chip-link">+' + (buttons.length - (compact ? 2 : 4)) + '</span>' : '') + '</div>' : '') +
+    '<div class="trigger__foot">' +
+      '<span><b>' + buttons.length + '</b> кнопок</span>' +
+      '<span>' + (media ? mediaLabel(item.media_type) : 'только текст') + '</span>' +
+    '</div>' +
+  '</article>';
+}
+
+function bindCardActions(root) {
+  root.querySelectorAll('[data-edit]').forEach(btn => {
+    btn.addEventListener('click', () => openEditor(btn.dataset.edit));
+  });
+  root.querySelectorAll('[data-delete]').forEach(btn => {
+    btn.addEventListener('click', () => deleteTrigger(btn.dataset.delete));
+  });
+  root.querySelectorAll('[data-open]').forEach(btn => {
+    btn.addEventListener('click', () => openEditor(btn.dataset.open));
+  });
+}
+
+function renderOverview(items) {
+  const box = document.getElementById('overview_list');
+  const preview = items.slice().sort((a, b) => a.phrase.localeCompare(b.phrase, 'ru')).slice(0, 6);
+  if (!preview.length) {
+    box.innerHTML = '<div class="empty" style="grid-column:1/-1;padding:36px 20px;">' +
+      '<span class="empty__icon"><i data-lucide="layers"></i></span>' +
+      '<b>База пока пуста</b><span>Добавьте первую заготовку — бот начнёт отвечать в группах.</span>' +
+      '</div>';
+    return;
+  }
+  box.innerHTML = preview.map(item => {
+    return '<article class="trigger glass" style="min-height:132px;cursor:pointer;" data-open="' + escapeAttr(item.phrase) + '">' +
+      '<div class="trigger__top">' +
+        '<div class="trigger__badges">' +
+          '<span class="pill pill--' + normType(item) + '">' + typeLabel(normType(item)) + '</span>' +
+          (item.file_id ? '<span class="pill pill--media">' + mediaLabel(item.media_type) + '</span>' : '') +
+        '</div>' +
+        '<span class="icon-btn" style="width:27px;height:27px;flex-basis:27px;border-radius:8px;"><i data-lucide="arrow-up-right"></i></span>' +
+      '</div>' +
+      '<h3 class="trigger__phrase">' + escapeHtml(item.phrase) + '</h3>' +
+      '<p class="trigger__text">' + escapeHtml(plainText(item.html_text) || 'Без текста') + '</p>' +
+    '</article>';
+  }).join('');
+  bindCardActions(box);
+}
+
+function renderTriggers() {
+  const box = document.getElementById('triggers_grid');
+  const empty = document.getElementById('triggers_empty');
+  const items = getItems().sort((a, b) => a.phrase.localeCompare(b.phrase, 'ru'));
+  const filtered = items.filter(item => {
+    const type = normType(item);
+    if (activeType !== 'all' && type !== activeType) return false;
+    if (!searchQuery) return true;
+    const haystack = [
+      item.phrase,
+      plainText(item.html_text),
+      item.pattern || '',
+      mediaLabel(item.media_type)
+    ].join(' ').toLowerCase();
+    return haystack.includes(searchQuery);
+  });
+
+  document.getElementById('shown_count').textContent = filtered.length + ' из ' + items.length;
+
+  if (!filtered.length) {
+    box.innerHTML = '';
+    empty.hidden = false;
+    refreshIcons();
+    return;
+  }
+
+  empty.hidden = true;
+  box.innerHTML = filtered.map(item => triggerCard(item, false)).join('');
+  bindCardActions(box);
+  refreshIcons();
+}
+
+document.getElementById('type_filters').addEventListener('click', event => {
+  const chip = event.target.closest('.chip');
+  if (!chip) return;
+  activeType = chip.dataset.type;
+  document.querySelectorAll('#type_filters .chip').forEach(item => {
+    item.classList.toggle('is-active', item === chip);
+  });
+  renderTriggers();
+});
+
+function setType(type) {
+  if (!TYPE_META[type]) return;
+  selectedType = type;
+  document.querySelectorAll('#type_segmented button').forEach(btn => {
+    btn.classList.toggle('is-active', btn.dataset.type === type);
+  });
+  document.getElementById('type_hint').textContent = TYPE_META[type].hint;
+  document.getElementById('phrase_hint').textContent = TYPE_META[type].phraseHint;
+
+  const patternField = document.getElementById('pattern_field');
+  patternField.hidden = type !== 'regex';
+  if (type === 'regex') {
+    const patternInput = document.getElementById('regex_pattern');
+    if (!patternInput.value.trim()) {
+      patternInput.value = document.getElementById('phrase').value.trim();
+    }
+  }
+  updatePreview();
+}
+
+function onPhraseInput() {
+  if (selectedType !== 'regex') return;
+  const patternInput = document.getElementById('regex_pattern');
+  if (!patternInput.value.trim()) {
+    patternInput.value = document.getElementById('phrase').value.trim();
+  }
+}
+
+function openEditor(phrase) {
+  editingOriginal = typeof phrase === 'string' ? phrase : '';
+  const item = editingOriginal ? currentDb[editingOriginal] : null;
+
+  document.getElementById('editor_eyebrow').textContent = item ? 'Edit trigger' : 'New trigger';
+  document.getElementById('editor_title').textContent = item ? 'Редактирование' : 'Новая заготовка';
+
+  const phraseInput = document.getElementById('phrase');
+  phraseInput.value = item ? editingOriginal : '';
+  document.getElementById('html_text').value = item ? (item.html_text || '') : '';
+
+  existingMediaType = item ? (item.media_type || 'text') : 'text';
+  existingFileId = item ? (item.file_id || '') : '';
+  document.getElementById('existing_media_type').value = existingMediaType;
+  document.getElementById('existing_file_id').value = existingFileId;
+
+  const fileInput = document.getElementById('media_file');
+  fileInput.value = '';
+  document.getElementById('file_name').textContent = 'Файл не выбран';
+
+  const box = document.getElementById('buttons_box');
+  box.innerHTML = '';
+  if (item && item.buttons) {
+    item.buttons.forEach(row => {
+      row.forEach((btn, index) => addBtnRow(btn.text, btn.url, index > 0));
+    });
+  }
+
+  const itemType = item ? normType(item) : 'contains';
+  setType(itemType);
+  document.getElementById('regex_pattern').value = item
+    ? (item.pattern || (itemType === 'regex' ? editingOriginal : ''))
+    : '';
+  updateMediaNote();
+  updatePreview();
+
+  const modal = document.getElementById('editor_modal');
+  modal.classList.add('is-open');
+  modal.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('locked');
+  refreshIcons();
+  setTimeout(() => phraseInput.focus(), 120);
+}
+
+function closeEditor() {
+  const modal = document.getElementById('editor_modal');
+  modal.classList.remove('is-open');
+  modal.setAttribute('aria-hidden', 'true');
+  if (document.getElementById('auth_overlay').style.display === 'none') {
+    document.body.classList.remove('locked');
+  }
+  editingOriginal = '';
+}
+
+function onFileChange() {
+  const file = document.getElementById('media_file').files[0];
+  document.getElementById('file_name').textContent = file ? file.name : 'Файл не выбран';
+  updateMediaNote();
+  updatePreview();
+}
+
+function updateMediaNote() {
+  const note = document.getElementById('existing_media_note');
+  const label = document.getElementById('existing_media_label');
+  const hasExisting = existingFileId && existingMediaType && existingMediaType !== 'text';
+  note.hidden = !hasExisting;
+  label.textContent = mediaLabel(existingMediaType);
+}
+
+function removeExistingMedia() {
+  existingMediaType = 'text';
+  existingFileId = '';
+  document.getElementById('existing_media_type').value = 'text';
+  document.getElementById('existing_file_id').value = '';
+  updateMediaNote();
+  updatePreview();
+  showToast('Медиа будет удалено после сохранения');
 }
 
 function wrapTag(tag) {
@@ -1226,7 +3055,7 @@ function wrapTag(tag) {
   const start = ta.selectionStart;
   const end = ta.selectionEnd;
   const selected = ta.value.substring(start, end) || 'текст';
-  ta.setRangeText(`<${tag}>${selected}</${tag}>`, start, end, 'select');
+  ta.setRangeText('<' + tag + '>' + selected + '</' + tag + '>', start, end, 'select');
   ta.focus();
   updatePreview();
 }
@@ -1239,26 +3068,28 @@ function insertLink() {
   const start = ta.selectionStart;
   const end = ta.selectionEnd;
   const selected = ta.value.substring(start, end) || 'Скачать';
-  ta.setRangeText(`<a href="${cleanUrl}">${selected}</a>`, start, end, 'select');
+  ta.setRangeText('<a href="' + cleanUrl + '">' + selected + '</a>', start, end, 'select');
   ta.focus();
   updatePreview();
 }
 
-function addBtnRow(text = '', url = '', sameRow = false) {
+function addBtnRow(text, url, sameRow) {
   const box = document.getElementById('buttons_box');
-  const div = document.createElement('div');
-  div.className = 'btn-row';
-  div.innerHTML = `
-    <input type="text" placeholder="Текст кнопки" value="${text}" class="b-text" style="flex:1" oninput="updatePreview()">
-    <input type="text" placeholder="https://... или @bot" value="${url}" class="b-url" style="flex:1" oninput="updatePreview()">
-    <label class="check-wrap">
-      <input type="checkbox" class="b-same" ${sameRow ? 'checked' : ''} onchange="updatePreview()"> В ряд
-    </label>
-    <button type="button" class="btn-del" onclick="this.parentElement.remove(); updatePreview()">
-      <i data-lucide="x"></i>
-    </button>
-  `;
-  box.appendChild(div);
+  const row = document.createElement('div');
+  row.className = 'btn-row';
+  row.innerHTML =
+    '<input type="text" class="b-text" placeholder="Текст кнопки" oninput="updatePreview()">' +
+    '<input type="text" class="b-url" placeholder="https://... или @bot" oninput="updatePreview()">' +
+    '<label class="check"><input type="checkbox" class="b-same" onchange="updatePreview()"> В ряд</label>' +
+    '<button type="button" class="icon-btn icon-btn--danger" title="Удалить кнопку"><i data-lucide="x"></i></button>';
+  row.querySelector('.b-text').value = text || '';
+  row.querySelector('.b-url').value = url || '';
+  row.querySelector('.b-same').checked = Boolean(sameRow);
+  row.querySelector('.icon-btn').addEventListener('click', () => {
+    row.remove();
+    updatePreview();
+  });
+  box.appendChild(row);
   refreshIcons();
   updatePreview();
 }
@@ -1272,9 +3103,9 @@ function collectButtonRows() {
     if (!text || !url) return;
     if (url.startsWith('@')) url = 'https://t.me/' + url.slice(1);
     if (same && rows.length > 0) {
-      rows[rows.length - 1].push({ text, url });
+      rows[rows.length - 1].push({ text: text, url: url });
     } else {
-      rows.push([{ text, url }]);
+      rows.push([{ text: text, url: url }]);
     }
   });
   return rows;
@@ -1282,122 +3113,66 @@ function collectButtonRows() {
 
 function updatePreview() {
   const text = document.getElementById('html_text').value;
-  const fileInput = document.getElementById('media_file');
-  const exMedia = document.getElementById('existing_media_type').value;
+  const file = document.getElementById('media_file').files[0];
   const bubble = document.getElementById('preview_bubble');
+  const mediaBox = document.getElementById('preview_media');
+  const mediaText = document.getElementById('preview_media_text');
 
-  let mediaNote = '';
-  if (fileInput.files.length > 0) {
-    mediaNote = `<div style="border:1px solid #333; padding:6px 10px; border-radius:8px; margin-bottom:8px; font-size:11px; color:#fff;">Файл: ${fileInput.files[0].name}</div>`;
-  } else if (exMedia && exMedia !== 'text') {
-    mediaNote = `<div style="border:1px solid #333; padding:6px 10px; border-radius:8px; margin-bottom:8px; font-size:11px; color:#fff;">Медиа в Telegram: ${exMedia}</div>`;
+  if (file) {
+    mediaBox.hidden = false;
+    mediaText.textContent = file.name;
+  } else if (existingFileId && existingMediaType !== 'text') {
+    mediaBox.hidden = false;
+    mediaText.textContent = 'Медиа в Telegram: ' + mediaLabel(existingMediaType);
+  } else {
+    mediaBox.hidden = true;
   }
 
-  if (!text && !mediaNote) {
-    bubble.innerHTML = '<span style="color: var(--muted);">Текст ответа появится здесь...</span>';
+  if (!text.trim()) {
+    bubble.innerHTML = '<span class="muted">Текст ответа появится здесь...</span>';
   } else {
-    bubble.innerHTML = mediaNote + (text || '');
+    bubble.innerHTML = text;
   }
 
   const rows = collectButtonRows();
-  const kbBox = document.getElementById('preview_kb');
-  kbBox.innerHTML = rows.map(row => `
-    <div class="tg-kb-line">
-      ${row.map(b => `<div class="tg-kb-item"><span>${b.text}</span><i data-lucide="arrow-up-right"></i></div>`).join('')}
-    </div>
-  `).join('');
+  const kb = document.getElementById('preview_kb');
+  kb.innerHTML = rows.map(row => {
+    return '<div class="tg__kb-line">' + row.map(btn => {
+      return '<div class="tg__kb-item"><span>' + escapeHtml(btn.text) + '</span><i data-lucide="arrow-up-right"></i></div>';
+    }).join('') + '</div>';
+  }).join('');
+
+  const count = rows.reduce((sum, row) => sum + row.length, 0);
+  document.getElementById('preview_type').textContent = typeLabel(selectedType);
+  document.getElementById('preview_buttons').textContent = count + ' кнопок';
   refreshIcons();
-}
-
-async function loadTriggers() {
-  try {
-    const res = await fetch('/api/triggers', {
-      headers: { 'X-Admin-Password': authPass }
-    });
-    if (res.status === 401) return false;
-    currentDb = await res.json();
-    document.getElementById('total_count').textContent = Object.keys(currentDb).length;
-    renderList();
-    return true;
-  } catch (e) {
-    return false;
-  }
-}
-
-function renderList() {
-  const box = document.getElementById('list_box');
-  const query = document.getElementById('search_input').value.trim().toLowerCase();
-  const keys = Object.keys(currentDb).sort().filter(k => {
-    const item = currentDb[k];
-    return k.includes(query) || (item.html_text || '').toLowerCase().includes(query);
-  });
-
-  if (!keys.length) {
-    box.innerHTML = '<p style="color:var(--muted); text-align:center; padding: 36px 0; font-size: 12px;">Список пуст</p>';
-    return;
-  }
-
-  box.innerHTML = '';
-  keys.forEach(phrase => {
-    const item = currentDb[phrase];
-    const div = document.createElement('div');
-    div.className = 'item-card';
-    const btns = (item.buttons || []).flat().map(b => `<span class="item-chip"><i data-lucide="link-2"></i> ${b.text}</span>`).join('');
-    div.innerHTML = `
-      <div class="item-head">
-        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
-          <span class="item-phrase">${phrase}</span>
-          <span class="type-pill">${item.media_type || 'text'}</span>
-        </div>
-        <div style="display:flex; gap:6px;">
-          <button class="btn-outline" style="padding:6px 10px; font-size:11px;" onclick='editTrigger(${JSON.stringify(phrase)})'>
-            <i data-lucide="pencil"></i>
-          </button>
-          <button class="btn-del" style="padding:6px 10px;" onclick='deleteTrigger(${JSON.stringify(phrase)})'>
-            <i data-lucide="trash-2"></i>
-          </button>
-        </div>
-      </div>
-      <div class="item-text">${item.html_text || '<span style="color:var(--muted)">(только медиафайл)</span>'}</div>
-      ${btns ? `<div class="item-chips">${btns}</div>` : ''}
-    `;
-    box.appendChild(div);
-  });
-  refreshIcons();
-}
-
-function editTrigger(phrase) {
-  const item = currentDb[phrase];
-  if (!item) return;
-  document.getElementById('form_title').textContent = 'РЕДАКТИРОВАНИЕ';
-  document.getElementById('phrase').value = phrase;
-  document.getElementById('html_text').value = item.html_text || '';
-  document.getElementById('existing_media_type').value = item.media_type || 'text';
-  document.getElementById('existing_file_id').value = item.file_id || '';
-  const box = document.getElementById('buttons_box');
-  box.innerHTML = '';
-  (item.buttons || []).forEach(row => {
-    row.forEach((btn, idx) => addBtnRow(btn.text, btn.url, idx > 0));
-  });
-  updatePreview();
-  window.scrollTo({ top: 0, behavior: 'smooth' });
-}
-
-function resetForm() {
-  document.getElementById('form_title').textContent = 'НОВАЯ ЗАГОТОВКА';
-  document.getElementById('phrase').value = '';
-  document.getElementById('html_text').value = '';
-  document.getElementById('media_file').value = '';
-  document.getElementById('existing_media_type').value = 'text';
-  document.getElementById('existing_file_id').value = '';
-  document.getElementById('buttons_box').innerHTML = '';
-  updatePreview();
 }
 
 async function saveTrigger() {
-  const phrase = document.getElementById('phrase').value.trim().toLowerCase();
+  const phraseInput = document.getElementById('phrase');
+  const phrase = phraseInput.value.trim();
   if (!phrase) {
     showToast('Введите фразу-триггер', true);
+    phraseInput.focus();
+    return;
+  }
+
+  const pattern = selectedType === 'regex'
+    ? (document.getElementById('regex_pattern').value.trim() || phrase)
+    : '';
+
+  if (selectedType === 'regex') {
+    try {
+      new RegExp(pattern, 'i');
+    } catch (e) {
+      showToast('Ошибка в regex: ' + e.message, true);
+      return;
+    }
+  }
+
+  const key = selectedType === 'regex' ? phrase : phrase.toLowerCase();
+  const conflict = currentDb[key] && key !== editingOriginal;
+  if (conflict && !confirm('Заготовка с такой фразой уже есть. Заменить её?')) {
     return;
   }
 
@@ -1406,10 +3181,13 @@ async function saveTrigger() {
 
   const form = new FormData();
   form.append('phrase', phrase);
+  form.append('original_phrase', editingOriginal || '');
+  form.append('match_type', selectedType);
+  form.append('pattern', pattern);
   form.append('html_text', document.getElementById('html_text').value);
   form.append('buttons', JSON.stringify(collectButtonRows()));
-  form.append('existing_media_type', document.getElementById('existing_media_type').value);
-  form.append('existing_file_id', document.getElementById('existing_file_id').value);
+  form.append('existing_media_type', existingMediaType);
+  form.append('existing_file_id', existingFileId);
 
   const fileInput = document.getElementById('media_file');
   if (fileInput.files.length > 0) {
@@ -1417,40 +3195,100 @@ async function saveTrigger() {
   }
 
   try {
-    const res = await fetch('/api/triggers', {
-      method: 'POST',
-      headers: { 'X-Admin-Password': authPass },
-      body: form
-    });
+    const res = await apiFetch('/api/triggers', { method: 'POST', body: form });
+    const body = await res.text();
     if (res.ok) {
-      resetForm();
-      await loadTriggers();
+      closeEditor();
+      await loadTriggers(true);
       showToast('Заготовка сохранена');
     } else {
-      showToast('Ошибка: ' + await res.text(), true);
+      showToast(body || 'Ошибка сохранения', true);
     }
+  } catch (e) {
+    showToast('Не удалось сохранить заготовку', true);
   } finally {
     btn.disabled = false;
   }
 }
 
 async function deleteTrigger(phrase) {
-  if (!confirm(`Удалить заготовку «${phrase}»?`)) return;
-  const res = await fetch('/api/triggers?phrase=' + encodeURIComponent(phrase), {
-    method: 'DELETE',
-    headers: { 'X-Admin-Password': authPass }
-  });
-  if (res.ok) {
-    await loadTriggers();
-    showToast('Удалено');
+  if (!confirm('Удалить заготовку «' + phrase + '»?')) return;
+  try {
+    const res = await apiFetch('/api/triggers?phrase=' + encodeURIComponent(phrase), { method: 'DELETE' });
+    if (res.ok) {
+      await loadTriggers(true);
+      showToast('Заготовка удалена');
+    } else {
+      const body = await res.text();
+      showToast(body || 'Ошибка удаления', true);
+    }
+  } catch (e) {
+    showToast('Не удалось удалить заготовку', true);
   }
 }
 
+async function exportBackup() {
+  try {
+    const res = await apiFetch('/api/export');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const blob = await res.blob();
+    const date = new Date().toISOString().slice(0, 10);
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'triggers-backup-' + date + '.json';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 2000);
+    showToast('Бэкап скачан');
+  } catch (e) {
+    showToast('Не удалось скачать бэкап', true);
+  }
+}
+
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') {
+    const modal = document.getElementById('editor_modal');
+    if (modal.classList.contains('is-open')) closeEditor();
+    else toggleSidebar(false);
+  }
+});
+
+document.querySelectorAll('.nav__link[data-view]').forEach(link => {
+  link.addEventListener('click', () => switchView(link.dataset.view));
+});
+
+const dropzone = document.getElementById('dropzone');
+['dragenter', 'dragover'].forEach(name => {
+  dropzone.addEventListener(name, event => {
+    event.preventDefault();
+    dropzone.classList.add('is-drag');
+  });
+});
+['dragleave', 'drop'].forEach(name => {
+  dropzone.addEventListener(name, event => {
+    event.preventDefault();
+    dropzone.classList.remove('is-drag');
+  });
+});
+dropzone.addEventListener('drop', event => {
+  if (event.dataTransfer.files.length) {
+    document.getElementById('media_file').files = event.dataTransfer.files;
+    onFileChange();
+  }
+});
+
+window.addEventListener('resize', () => {
+  if (window.innerWidth > 980) toggleSidebar(false);
+});
+
 refreshIcons();
 if (authPass) {
-  loadTriggers().then(ok => {
-    if (ok) document.getElementById('auth_overlay').style.display = 'none';
+  loadTriggers(true).then(ok => {
+    if (ok) unlockPanel();
   });
+} else {
+  setTimeout(() => document.getElementById('pass_input').focus(), 150);
 }
 </script>
 </body>
@@ -1475,9 +3313,43 @@ async def handle_ping(request: web.Request):
     return web.Response(text="OK")
 
 
+def clean_buttons(raw: object) -> list[list[dict]]:
+    result: list[list[dict]] = []
+    if not isinstance(raw, list):
+        return result
+    for row in raw:
+        if not isinstance(row, list):
+            continue
+        clean_row = []
+        for btn in row:
+            if not isinstance(btn, dict):
+                continue
+            text = str(btn.get("text", "")).strip()
+            url = str(btn.get("url", "")).strip()
+            if text and url:
+                clean_row.append({"text": text, "url": url})
+        if clean_row:
+            result.append(clean_row)
+    return result
+
+
 async def handle_get_triggers(request: web.Request):
     check_auth(request)
     return web.json_response(await get_all_triggers())
+
+
+async def handle_export_triggers(request: web.Request):
+    check_auth(request)
+    db = await get_all_triggers()
+    payload = json.dumps(db, ensure_ascii=False, indent=2)
+    return web.Response(
+        text=payload,
+        content_type="application/json",
+        charset="utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="triggers-backup.json"'
+        },
+    )
 
 
 async def handle_save_trigger(request: web.Request):
@@ -1499,50 +3371,99 @@ async def handle_save_trigger(request: web.Request):
         else:
             fields[part.name] = await part.text()
 
-    phrase = fields.get("phrase", "").strip().lower()
-    if not phrase:
-        return web.Response(status=400, text="Empty phrase")
+    raw_phrase = fields.get("phrase", "").strip()
+    if not raw_phrase:
+        return web.Response(status=400, text="Пустая фраза-триггер")
+
+    original_phrase = fields.get("original_phrase", "").strip()
+    existing = None
+    if original_phrase:
+        existing = await get_trigger(original_phrase)
+    if existing is None:
+        existing = await get_trigger(raw_phrase) or await get_trigger(raw_phrase.lower())
+    existing = existing or {}
+
+    match_type = fields.get("match_type", "").strip()
+    if match_type not in VALID_MATCH_TYPES:
+        if existing:
+            match_type = get_item_match_type(original_phrase or raw_phrase, existing)
+        else:
+            match_type = "exact"
+
+    phrase = raw_phrase.lower() if match_type in ("exact", "contains") else raw_phrase
+    pattern = fields.get("pattern", "").strip()
+
+    if match_type == "regex":
+        pattern = pattern or phrase
+        try:
+            re.compile(pattern, re.IGNORECASE)
+        except re.error as e:
+            return web.Response(status=400, text=f"Ошибка в regex: {e}")
 
     html_text = fields.get("html_text", "")
-    buttons = json.loads(fields.get("buttons", "[]"))
-    media_type = fields.get("existing_media_type", "text")
+    try:
+        buttons = clean_buttons(json.loads(fields.get("buttons", "[]")))
+    except Exception:
+        return web.Response(status=400, text="Некорректный список кнопок")
+
+    media_type = fields.get("existing_media_type", "text") or "text"
     file_id = fields.get("existing_file_id") or None
 
     if file_bytes and file_name:
-        inp = BufferedInputFile(file_bytes, filename=file_name)
-        if content_type.startswith("image/gif"):
-            sent = await bot.send_animation(ADMIN_ID, inp)
-            media_type, file_id = "animation", sent.animation.file_id
-        elif content_type.startswith("image/"):
-            sent = await bot.send_photo(ADMIN_ID, inp)
-            media_type, file_id = "photo", sent.photo[-1].file_id
-        elif content_type.startswith("video/"):
-            sent = await bot.send_video(ADMIN_ID, inp)
-            media_type, file_id = "video", sent.video.file_id
-        else:
-            sent = await bot.send_document(ADMIN_ID, inp)
-            media_type, file_id = "document", sent.document.file_id
         try:
-            await bot.delete_message(ADMIN_ID, sent.message_id)
-        except Exception:
-            pass
+            inp = BufferedInputFile(file_bytes, filename=file_name)
+            if content_type.startswith("image/gif"):
+                sent = await bot.send_animation(ADMIN_ID, inp)
+                media_type, file_id = "animation", sent.animation.file_id
+            elif content_type.startswith("image/"):
+                sent = await bot.send_photo(ADMIN_ID, inp)
+                media_type, file_id = "photo", sent.photo[-1].file_id
+            elif content_type.startswith("video/"):
+                sent = await bot.send_video(ADMIN_ID, inp)
+                media_type, file_id = "video", sent.video.file_id
+            else:
+                sent = await bot.send_document(ADMIN_ID, inp)
+                media_type, file_id = "document", sent.document.file_id
+            try:
+                await bot.delete_message(ADMIN_ID, sent.message_id)
+            except Exception:
+                pass
+        except Exception as e:
+            return web.Response(status=502, text=f"Не удалось загрузить медиа: {e}")
 
-    await save_trigger_db(
-        phrase,
+    item = dict(existing)
+    item.update(
         {
             "media_type": media_type,
             "file_id": file_id,
             "html_text": html_text,
             "buttons": buttons,
-        },
+            "match_type": match_type,
+        }
     )
-    return web.json_response({"ok": True})
+    if match_type == "regex":
+        item["pattern"] = pattern
+    else:
+        item.pop("pattern", None)
+
+    await save_trigger_db(phrase, item)
+
+    if original_phrase and original_phrase != phrase:
+        old_key = original_phrase
+        if await get_trigger(old_key) is None and old_key.lower() != old_key:
+            old_key = old_key.lower()
+        if old_key != phrase:
+            await delete_trigger_db(old_key)
+
+    return web.json_response({"ok": True, "phrase": phrase, "match_type": match_type})
 
 
 async def handle_delete_trigger(request: web.Request):
     check_auth(request)
-    phrase = request.query.get("phrase", "").strip().lower()
+    phrase = request.query.get("phrase", "").strip()
     if phrase:
+        if await get_trigger(phrase) is None and phrase.lower() != phrase:
+            phrase = phrase.lower()
         await delete_trigger_db(phrase)
     return web.json_response({"ok": True})
 
@@ -1552,6 +3473,7 @@ async def start_web_server():
     app.router.add_get("/", handle_index)
     app.router.add_get("/ping", handle_ping)
     app.router.add_get("/api/triggers", handle_get_triggers)
+    app.router.add_get("/api/export", handle_export_triggers)
     app.router.add_post("/api/triggers", handle_save_trigger)
     app.router.add_delete("/api/triggers", handle_delete_trigger)
     runner = web.AppRunner(app)
@@ -1563,6 +3485,10 @@ async def start_web_server():
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await migrate_legacy_triggers()
+    except Exception as e:
+        print(f"Не удалось выполнить миграцию старых записей: {e}")
     await start_web_server()
     try:
         await dp.start_polling(bot)

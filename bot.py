@@ -7,6 +7,7 @@ import random
 import re
 import ssl
 import time
+from collections.abc import Callable
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
@@ -42,6 +43,8 @@ DB_HASH_KEY = "bot:triggers"
 # --- АВТООТВЕТЫ: ОТДЕЛЬНЫЕ КЛЮЧИ REDIS (старые данные bot:triggers не трогаем) ---
 MEDIA_REPLIES_KEY = "bot:media_replies"
 CHANNEL_REPLY_KEY = "bot:channel_reply"
+CHANNEL_CHAT_CONFIGS_KEY = "bot:channel_reply:chats"
+CHANNEL_CHAT_TITLES_KEY = "bot:channel_reply:chat_titles"
 SETTINGS_KEY = "bot:settings"
 STATS_KEY = "bot:stats"
 LAST_REPLY_PREFIX = "bot:last_reply"
@@ -1227,23 +1230,51 @@ def normalize_channel_config(raw: object) -> dict:
     }
 
 
-async def get_channel_config() -> dict:
-    raw = await redis_client.get(CHANNEL_REPLY_KEY)
-    if raw:
-        try:
-            data = json.loads(raw)
-            if isinstance(data, dict):
-                return normalize_channel_config(data)
-        except Exception:
-            pass
-    return normalize_channel_config(None)
+def decode_channel_config(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    return normalize_channel_config(data) if isinstance(data, dict) else None
 
 
-async def save_channel_config(config: dict) -> None:
-    await redis_client.set(
-        CHANNEL_REPLY_KEY,
-        json.dumps(normalize_channel_config(config), ensure_ascii=False),
-    )
+async def get_channel_config(chat_id: int | str | None = None) -> dict:
+    if chat_id is not None:
+        raw = await redis_client.hget(CHANNEL_CHAT_CONFIGS_KEY, str(chat_id))
+        override = decode_channel_config(raw)
+        if override is not None:
+            return override
+    return decode_channel_config(await redis_client.get(CHANNEL_REPLY_KEY)) or normalize_channel_config(None)
+
+
+async def update_channel_config(chat_id: str | None, update: Callable[[dict], None]) -> dict:
+    async def apply(pipe):
+        config = None
+        if chat_id is not None:
+            config = decode_channel_config(await pipe.hget(CHANNEL_CHAT_CONFIGS_KEY, chat_id))
+        if config is None:
+            config = decode_channel_config(await pipe.get(CHANNEL_REPLY_KEY)) or normalize_channel_config(None)
+
+        update(config)
+        config = normalize_channel_config(config)
+        raw = json.dumps(config, ensure_ascii=False)
+        pipe.multi()
+        if chat_id is None:
+            pipe.set(CHANNEL_REPLY_KEY, raw)
+        else:
+            pipe.hset(CHANNEL_CHAT_CONFIGS_KEY, chat_id, raw)
+        return config
+
+    keys = (CHANNEL_REPLY_KEY,) if chat_id is None else (CHANNEL_REPLY_KEY, CHANNEL_CHAT_CONFIGS_KEY)
+    return await redis_client.transaction(apply, *keys, value_from_callable=True)
+
+
+async def remember_channel_chat(message: Message):
+    title = message.chat.title
+    if title:
+        await redis_client.hset(CHANNEL_CHAT_TITLES_KEY, str(message.chat.id), title)
 
 
 def normalize_settings(raw: object) -> dict:
@@ -1377,7 +1408,7 @@ async def maybe_media_reply(message: Message, settings: dict):
 async def handle_channel_post(message: Message, settings: dict | None = None):
     """Ответ на пост от Telegram-канала: в группе или в самом канале."""
     settings = settings or await get_settings()
-    config = await get_channel_config()
+    config = await get_channel_config(message.chat.id)
     if not config["enabled"] or not config["answers"]:
         return
     if message.chat.type in ("group", "supergroup"):
@@ -1402,9 +1433,10 @@ async def handle_channel_post(message: Message, settings: dict | None = None):
         print(f"Ошибка ответа на пост канала: {e}")
 
 
-@router.message(F.chat.type == "channel")
+@router.channel_post()
 async def channel_chat_post(message: Message):
     """Посты в самом канале (если бот — админ канала)."""
+    await remember_channel_chat(message)
     await handle_channel_post(message)
 
 
@@ -1415,12 +1447,9 @@ async def channel_chat_post(message: Message):
 async def group_auto_reply(message: Message):
     settings = await get_settings()
 
-    # Не отвечаем другим ботам — защита от бесконечных петель
-    if settings["ignore_bots"] and message.from_user and message.from_user.is_bot:
-        return
-
     # Пост от Telegram-канала: триггеры приоритетнее, иначе — автоответ канала
     if is_channel_post(message):
+        await remember_channel_chat(message)
         incoming = message.text or message.caption
         if incoming:
             db = await get_all_triggers()
@@ -1436,6 +1465,10 @@ async def group_auto_reply(message: Message):
                     print(f"Ошибка при отправке ответа в чат: {e}")
                 return
         await handle_channel_post(message, settings)
+        return
+
+    # Телеграм может использовать системного отправителя у постов канала.
+    if settings["ignore_bots"] and message.from_user and message.from_user.is_bot:
         return
 
     incoming = message.text or message.caption
@@ -1512,6 +1545,25 @@ WEB_HTML = r"""<!DOCTYPE html>
   ::selection { background: var(--ink); color: #050505; }
 
   button, input, textarea, select { font: inherit; }
+  .channel-picker select {
+    width: 100%;
+    min-width: 0;
+    padding: 9px 12px;
+    color: inherit;
+    background: #131313;
+    border: 1px solid rgba(255, 255, 255, .12);
+    border-radius: 10px;
+    color-scheme: dark;
+  }
+  .channel-picker summary { cursor: pointer; font-size: 12px; }
+  .channel-picker__form {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .channel-picker [hidden] { display: none; }
 
   button { color: inherit; }
 
@@ -3507,7 +3559,9 @@ let editingOriginal = '';
 let existingMediaType = 'text';
 let existingFileId = '';
 let toastTimer = null;
-let autoData = { media: {}, channel: {}, settings: {}, stats: {} };
+let autoData = { media: {}, channel: {}, channel_chats: {}, channel_configs: {}, settings: {}, stats: {} };
+let activeChannelScope = 'channel';
+let scopeSaveQueue = Promise.resolve();
 let editingScope = '';
 let editingIndex = -1;
 let answerMediaType = 'text';
@@ -4230,6 +4284,10 @@ async function loadAuto(silent) {
     const res = await apiFetch('/api/auto');
     if (!res.ok) throw new Error('HTTP ' + res.status);
     autoData = await res.json();
+    if (activeChannelScope !== 'channel') {
+      const id = activeChannelScope.slice('channel@'.length);
+      if (!autoData.channel_chats?.[id] && !autoData.channel_configs?.[id]) activeChannelScope = 'channel';
+    }
     if (!autoData.media) autoData.media = {};
     renderAuto();
     renderAutoStats();
@@ -4240,14 +4298,21 @@ async function loadAuto(silent) {
   }
 }
 
+function isChannelScope(scope) {
+  return scope === 'channel' || scope.startsWith('channel@');
+}
+
 function scopeConfig(scope) {
-  if (scope === 'channel') return autoData.channel || {};
+  if (isChannelScope(scope)) {
+    const chatConfig = autoData.channel_configs?.[scope.slice('channel@'.length)];
+    return chatConfig || autoData.channel || {};
+  }
   return (autoData.media && autoData.media[scope]) || {};
 }
 
 function answersTotal() {
   let total = (autoData.channel && autoData.channel.answers ? autoData.channel.answers.length : 0);
-  Object.values(autoData.media || {}).forEach(cfg => {
+  [...Object.values(autoData.media || {}), ...Object.values(autoData.channel_configs || {})].forEach(cfg => {
     total += (cfg.answers || []).length;
   });
   return total;
@@ -4341,7 +4406,12 @@ function onChanceChange(el) {
   saveScopeConfig(scope, { chance: val });
 }
 
-async function saveScopeConfig(scope, patch) {
+function saveScopeConfig(scope, patch) {
+  scopeSaveQueue = scopeSaveQueue.then(() => persistScopeConfig(scope, patch));
+  return scopeSaveQueue;
+}
+
+async function persistScopeConfig(scope, patch) {
   try {
     const res = await apiFetch('/api/auto/config', {
       method: 'POST',
@@ -4351,22 +4421,104 @@ async function saveScopeConfig(scope, patch) {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const body = await res.json();
     if (scope === 'channel') autoData.channel = body.config;
-    else autoData.media[scope] = body.config;
+    else if (isChannelScope(scope)) {
+      if (!autoData.channel_configs) autoData.channel_configs = {};
+      autoData.channel_configs[scope.slice('channel@'.length)] = body.config;
+      if (activeChannelScope === scope) syncChannelState();
+    } else autoData.media[scope] = body.config;
     showToast('Настройка сохранена');
+    return true;
   } catch (e) {
     showToast('Не удалось сохранить настройку', true);
     loadAuto(true);
+    return false;
+  }
+}
+
+function channelChatLabel(chatId) {
+  const title = autoData.channel_chats?.[chatId];
+  return title ? title + ' · ' + chatId : 'Чат ' + chatId;
+}
+
+function syncChannelState() {
+  const status = document.getElementById('channel_state');
+  const reset = document.getElementById('channel_reset');
+  const separate = !!autoData.channel_configs?.[activeChannelScope.slice('channel@'.length)];
+  status.textContent = activeChannelScope === 'channel' ? '' : separate
+    ? 'Отдельные настройки этого чата'
+    : 'Сейчас действуют общие настройки. Изменения сохранятся только для этого чата.';
+  reset.hidden = !separate;
+}
+
+async function addChannelChat(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const input = form.querySelector('input');
+  const chatId = input.value.trim();
+  if (!/^-[1-9][0-9]{0,15}$/.test(chatId) || Math.abs(Number(chatId)) >= 2 ** 52) {
+    showToast('Укажите отрицательный Telegram ID группы или канала', true);
+    input.focus();
+    return;
+  }
+  const scope = 'channel@' + chatId;
+  if (!autoData.channel_chats?.[chatId] && !autoData.channel_configs?.[chatId]) {
+    const submit = form.querySelector('button');
+    submit.disabled = true;
+    if (!await saveScopeConfig(scope, {})) {
+      submit.disabled = false;
+      return;
+    }
+  }
+  activeChannelScope = scope;
+  renderChannelPanel();
+  refreshIcons();
+}
+
+async function resetChannelChat() {
+  const scope = activeChannelScope;
+  if (!confirm('Сбросить настройки этого чата и использовать общие?')) return;
+  const button = document.getElementById('channel_reset');
+  button.disabled = true;
+  try {
+    await scopeSaveQueue;
+    const res = await apiFetch('/api/auto/channel-chat?scope=' + encodeURIComponent(scope), { method: 'DELETE' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    await loadAuto(true);
+    showToast('Для чата применяются общие настройки');
+  } catch (e) {
+    showToast('Не удалось сбросить настройки чата', true);
+  } finally {
+    button.disabled = false;
   }
 }
 
 function renderChannelPanel() {
-  const cfg = scopeConfig('channel');
+  const scope = activeChannelScope;
+  const cfg = scopeConfig(scope);
+  const chatIds = [...new Set([
+    ...Object.keys(autoData.channel_chats || {}), ...Object.keys(autoData.channel_configs || {})
+  ])];
+  chatIds.sort((a, b) => channelChatLabel(a).localeCompare(channelChatLabel(b), 'ru'));
+  const chatOptions = chatIds.map(id => '<option value="channel@' + escapeHtml(id) + '"' +
+    (scope === 'channel@' + id ? ' selected' : '') + '>' + escapeHtml(channelChatLabel(id)) + '</option>').join('');
   const answers = cfg.answers || [];
   const variants = answers.length
-    ? answers.map((a, i) => variantRowHtml('channel', i, a)).join('')
+    ? answers.map((a, i) => variantRowHtml(scope, i, a)).join('')
     : '<div class="variants-empty">Вариантов пока нет — добавьте первый ответ.</div>';
   const box = document.getElementById('channel_panel');
   box.innerHTML =
+    '<div class="field channel-picker">' +
+      '<label class="field__label" for="channel_chat">Чат</label>' +
+      '<select id="channel_chat"><option value="channel">Общие настройки</option>' + chatOptions + '</select>' +
+      '<span class="field__hint" id="channel_state"></span>' +
+      '<details><summary>Добавить чат по Telegram ID</summary>' +
+        '<form class="channel-picker__form" id="channel_add">' +
+          '<input type="text" inputmode="text" placeholder="-1001234567890" aria-label="Telegram ID чата" required>' +
+          '<button type="submit" class="btn btn--glass btn--sm">Добавить</button>' +
+        '</form>' +
+      '</details>' +
+      '<button id="channel_reset" type="button" class="btn btn--glass btn--sm" hidden>Вернуть общие настройки</button>' +
+    '</div>' +
     '<div class="toggle-row">' +
       '<div class="toggle-row__label"><b>Отвечать на посты канала</b><span>Бот отвечает случайным вариантом с шансом ниже</span></div>' +
       '<label class="switch"><input type="checkbox" data-ctoggle="enabled"' + (cfg.enabled ? ' checked' : '') + '><i></i></label>' +
@@ -4380,19 +4532,28 @@ function renderChannelPanel() {
       '<label class="switch"><input type="checkbox" data-ctoggle="in_channels"' + (cfg.in_channels ? ' checked' : '') + '><i></i></label>' +
     '</div>' +
     '<div class="chance-row">' +
-      '<input type="range" min="0" max="100" step="5" value="' + (cfg.chance || 0) + '" data-chance="channel" onchange="onChanceChange(this)">' +
-      '<span class="chance-val" data-chance-val="channel">' + (cfg.chance || 0) + '%</span>' +
+      '<input type="range" min="0" max="100" step="5" value="' + (cfg.chance || 0) + '" data-chance="' + scope + '" onchange="onChanceChange(this)">' +
+      '<span class="chance-val" data-chance-val="' + scope + '">' + (cfg.chance || 0) + '%</span>' +
     '</div>' +
     '<div class="auto-section" style="margin-bottom:10px;">' + variants + '</div>' +
-    '<button class="btn btn--glass btn--sm btn--block" type="button" style="border-style:dashed;" onclick="openAnswerEditor(\'channel\', -1)">' +
+    '<button id="channel_add_answer" class="btn btn--glass btn--sm btn--block" type="button" style="border-style:dashed;">' +
       '<i data-lucide="plus"></i><span>Добавить вариант ответа</span>' +
     '</button>';
   bindAutoCardActions(box);
+  box.querySelector('#channel_chat').addEventListener('change', event => {
+    activeChannelScope = event.target.value;
+    renderChannelPanel();
+    refreshIcons();
+  });
+  box.querySelector('#channel_add').addEventListener('submit', addChannelChat);
+  box.querySelector('#channel_reset').addEventListener('click', resetChannelChat);
+  box.querySelector('#channel_add_answer').addEventListener('click', () => openAnswerEditor(scope, -1));
+  syncChannelState();
   box.querySelectorAll('[data-ctoggle]').forEach(el => {
     el.addEventListener('change', () => {
       const patch = {};
       patch[el.dataset.ctoggle] = el.checked;
-      saveScopeConfig('channel', patch);
+      saveScopeConfig(scope, patch);
     });
   });
 }
@@ -4473,7 +4634,8 @@ function openAnswerEditor(scope, index) {
   const answers = scopeConfig(scope).answers || [];
   const item = (index >= 0 && index < answers.length) ? answers[index] : null;
 
-  const scopeTitle = scope === 'channel' ? 'Посты канала' : AUTO_MEDIA_TITLES[scope];
+  const scopeTitle = scope === 'channel' ? 'Посты канала' : isChannelScope(scope)
+    ? channelChatLabel(scope.slice('channel@'.length)) : AUTO_MEDIA_TITLES[scope];
   document.getElementById('answer_eyebrow').textContent = item ? 'Edit variant' : 'New variant';
   document.getElementById('answer_title').textContent = (item ? 'Редактирование · ' : 'Новый вариант · ') + scopeTitle;
 
@@ -4865,16 +5027,17 @@ async def handle_delete_trigger(request: web.Request):
 
 
 def parse_auto_scope(scope: str) -> tuple[str, str | None]:
-    """'media:photo' или просто 'photo' -> ('media', 'photo'), 'channel' -> ('channel', None)."""
+    """Разбирает область автоответа и ключ медиа или чата."""
     scope = (scope or "").strip()
     if scope == "channel":
         return "channel", None
-    if scope.startswith("media:"):
-        media_type = scope.split(":", 1)[1]
-        if media_type in AUTO_MEDIA_TYPES:
-            return "media", media_type
-    if scope in AUTO_MEDIA_TYPES:
-        return "media", scope
+    if scope.startswith("channel@"):
+        chat_id = scope.removeprefix("channel@")
+        if re.fullmatch(r"-[1-9][0-9]{0,15}", chat_id) and abs(int(chat_id)) < 2**52:
+            return "channel", chat_id
+    media_type = scope.removeprefix("media:")
+    if media_type in AUTO_MEDIA_TYPES:
+        return "media", media_type
     return "", None
 
 
@@ -4884,6 +5047,12 @@ async def handle_get_auto(request: web.Request):
         {
             "media": await get_all_media_configs(),
             "channel": await get_channel_config(),
+            "channel_chats": await redis_client.hgetall(CHANNEL_CHAT_TITLES_KEY),
+            "channel_configs": {
+                chat_id: config
+                for chat_id, raw in (await redis_client.hgetall(CHANNEL_CHAT_CONFIGS_KEY)).items()
+                if (config := decode_channel_config(raw)) is not None
+            },
             "settings": await get_settings(),
             "stats": await get_stats(),
         }
@@ -4899,24 +5068,46 @@ async def handle_save_auto_config(request: web.Request):
     if not isinstance(body, dict):
         return web.Response(status=400, text="Некорректный JSON")
 
-    scope, media_type = parse_auto_scope(str(body.get("scope", "")))
+    scope, scope_key = parse_auto_scope(str(body.get("scope", "")))
     if not scope:
         return web.Response(status=400, text="Неизвестный scope")
 
     if scope == "channel":
-        config = await get_channel_config()
-        for field in ("enabled", "chance", "in_groups", "in_channels"):
-            if field in body:
-                config[field] = body[field]
-        await save_channel_config(config)
-        return web.json_response({"ok": True, "config": await get_channel_config()})
+        patch = {
+            field: body[field]
+            for field in ("enabled", "chance", "in_groups", "in_channels")
+            if field in body
+        }
+        config = await update_channel_config(scope_key, lambda current: current.update(patch))
+        return web.json_response({"ok": True, "config": config})
 
+    media_type = scope_key
     config = await get_media_config(media_type)
     for field in ("enabled", "chance"):
         if field in body:
             config[field] = body[field]
     await save_media_config(media_type, config)
     return web.json_response({"ok": True, "config": await get_media_config(media_type)})
+
+
+async def handle_reset_channel_chat(request: web.Request):
+    check_auth(request)
+    scope, chat_id = parse_auto_scope(request.query.get("scope", ""))
+    if scope != "channel" or chat_id is None:
+        return web.Response(status=400, text="Некорректный ID чата")
+    await redis_client.hdel(CHANNEL_CHAT_CONFIGS_KEY, chat_id)
+    return web.json_response({"ok": True})
+
+
+def change_auto_answer(config: dict, index: int, answer: dict | None) -> None:
+    answers = config["answers"]
+    if 0 <= index < len(answers):
+        if answer is None:
+            answers.pop(index)
+        else:
+            answers[index] = answer
+    elif answer is not None:
+        answers.append(answer)
 
 
 async def handle_save_auto_answer(request: web.Request):
@@ -4938,7 +5129,7 @@ async def handle_save_auto_answer(request: web.Request):
         else:
             fields[part.name] = await part.text()
 
-    scope, media_type = parse_auto_scope(fields.get("scope", ""))
+    scope, scope_key = parse_auto_scope(fields.get("scope", ""))
     if not scope:
         return web.Response(status=400, text="Неизвестный scope")
 
@@ -4951,11 +5142,6 @@ async def handle_save_auto_answer(request: web.Request):
         buttons = clean_buttons(json.loads(fields.get("buttons", "[]")))
     except Exception:
         return web.Response(status=400, text="Некорректный список кнопок")
-
-    if scope == "channel":
-        config = await get_channel_config()
-    else:
-        config = await get_media_config(media_type)
 
     media_type_saved = fields.get("existing_media_type", "text") or "text"
     file_id = fields.get("existing_file_id") or None
@@ -4995,23 +5181,18 @@ async def handle_save_auto_answer(request: web.Request):
         "buttons": buttons,
     }
 
-    answers = list(config.get("answers", []))
-    if 0 <= index < len(answers):
-        answers[index] = answer
-    else:
-        answers.append(answer)
-    config["answers"] = answers
-
     if scope == "channel":
-        await save_channel_config(config)
+        await update_channel_config(scope_key, lambda config: change_auto_answer(config, index, answer))
     else:
-        await save_media_config(media_type, config)
+        config = await get_media_config(scope_key)
+        change_auto_answer(config, index, answer)
+        await save_media_config(scope_key, config)
     return web.json_response({"ok": True})
 
 
 async def handle_delete_auto_answer(request: web.Request):
     check_auth(request)
-    scope, media_type = parse_auto_scope(request.query.get("scope", ""))
+    scope, scope_key = parse_auto_scope(request.query.get("scope", ""))
     if not scope:
         return web.Response(status=400, text="Неизвестный scope")
     try:
@@ -5020,18 +5201,12 @@ async def handle_delete_auto_answer(request: web.Request):
         index = -1
 
     if scope == "channel":
-        config = await get_channel_config()
+        await update_channel_config(scope_key, lambda config: change_auto_answer(config, index, None))
     else:
-        config = await get_media_config(media_type)
-
-    answers = list(config.get("answers", []))
-    if 0 <= index < len(answers):
-        answers.pop(index)
-        config["answers"] = answers
-        if scope == "channel":
-            await save_channel_config(config)
-        else:
-            await save_media_config(media_type, config)
+        config = await get_media_config(scope_key)
+        if 0 <= index < len(config["answers"]):
+            change_auto_answer(config, index, None)
+            await save_media_config(scope_key, config)
     return web.json_response({"ok": True})
 
 
@@ -5068,6 +5243,7 @@ def build_web_app() -> web.Application:
     app.router.add_delete("/api/triggers", handle_delete_trigger)
     app.router.add_get("/api/auto", handle_get_auto)
     app.router.add_post("/api/auto/config", handle_save_auto_config)
+    app.router.add_delete("/api/auto/channel-chat", handle_reset_channel_chat)
     app.router.add_post("/api/auto/answer", handle_save_auto_answer)
     app.router.add_delete("/api/auto/answer", handle_delete_auto_answer)
     app.router.add_post("/api/settings", handle_save_settings)

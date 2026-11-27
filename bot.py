@@ -476,7 +476,9 @@ def _game_http() -> aiohttp.ClientSession:
 
 async def game_api_get(path: str, bot_secret: bool = False):
     """GET к игровому API. Возвращает (status, json|None). Ошибки сети — (0, None)."""
-    headers = {"X-Bot-Secret": GAME_API_SECRET} if bot_secret else {}
+    headers = {"X-Bot-Secret": GAME_API_SECRET} if bot_secret else {
+        "Authorization": f"Bearer {GAME_ADMIN_TOKEN}",
+    }
     timeout = aiohttp.ClientTimeout(total=11, connect=5, sock_connect=5, sock_read=8)
     for attempt in range(2):
         try:

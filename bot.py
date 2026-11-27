@@ -33,7 +33,7 @@ TOKEN = os.getenv("BOT_TOKEN", "9209163816:AAFMjQ4Q5NUWBatcPXjl6oQJyrqoshrHAVY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "7831019966"))
 REDIS_URL = os.getenv("REDIS_URL", "rediss://default:gQAAAAAAAR8zAAIgcDE5YTVjZjE0OTU3MzA0ZDFmYjY1MDBkNDRjMGViMmQ5YQ@in-lemur-73523.upstash.io:6379").strip()
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "noranoomi2121").strip()
-GAME_ADMIN_TOKEN = os.getenv("GAME_ADMIN_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjU5NiwiaXNfYWRtaW4iOnRydWUsImlhdCI6MTc5NTc5NTY1MiwiZXhwIjoxODAzNTcxNjUyLCJqdGkiOiIwMzZiODI2MDI4NTdmOWExZWM4OTgzMDMzYmE4ZjZiNiJ9.P7Cac5MTdtSSm_WPhMJDF4ZWetRx9__YvXvBCdzHPV0").strip()
+GAME_ADMIN_TOKEN = os.getenv("GAME_ADMIN_TOKEN", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjU5NiwiaXNfYWRtaW4iOnRydWUsImlhdCI6MTc5NTcyNTM4MiwiZXhwIjoxODAzNTAxMzgyLCJqdGkiOiI4ZWRiYzcwOTU1YjA4NjhmNGY3YTcxZmZhMWJhMThkMSJ9.TBcNiN5c5K8VMGdwD2TSfhgR4ipxH4OoJ_mmTH-Dp1o").strip()
 WEB_HOST = "0.0.0.0"
 WEB_PORT = int(os.getenv("PORT", "8080"))
 
@@ -431,7 +431,7 @@ async def safe_edit_menu(chat_id: int, message_id: int | None, text: str, kb: In
 # Обработчики зарегистрированы ДО catch-all (private_stranger / group_auto_reply),
 # поэтому имеют приоритет над автоответами.
 
-GAMESERVER_API = os.getenv("GAMESERVER_API", "https://87.58.220.8:8443").rstrip("/")
+GAMESERVER_API = os.getenv("GAMESERVER_API", "https://85.192.20.22:13882").rstrip("/")
 GAME_API_SECRET = os.getenv(
     "GAME_API_SECRET", "ZYs8n0qHGIm24VpFeYfdGu7uuEcOXslqDHca3vxVBs8"
 ).strip()
@@ -440,7 +440,7 @@ PREMIUM_ADMIN_IDS = frozenset({7831019966, 6793480366, 7594234830})
 GAME_ADMIN_TLS_SHA256 = os.getenv(
     "GAME_ADMIN_TLS_SHA256",
     "7816f62148e353a6c1a631bff20ec31817b0fc4f73bf656e02fe3393c6c059f9"
-    if GAMESERVER_API == "https://87.58.220.8:8443" else "",
+    if GAMESERVER_API == "https://85.192.20.22:13882" else "",
 ).strip()
 
 try:

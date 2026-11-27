@@ -431,7 +431,7 @@ async def safe_edit_menu(chat_id: int, message_id: int | None, text: str, kb: In
 # Обработчики зарегистрированы ДО catch-all (private_stranger / group_auto_reply),
 # поэтому имеют приоритет над автоответами.
 
-GAMESERVER_API = os.getenv("GAMESERVER_API", "https://85.192.20.22:13882").rstrip("/")
+GAMESERVER_API = os.getenv("GAMESERVER_API", "https://87.58.220.8:13882").rstrip("/")
 GAME_API_SECRET = os.getenv(
     "GAME_API_SECRET", "ZYs8n0qHGIm24VpFeYfdGu7uuEcOXslqDHca3vxVBs8"
 ).strip()
@@ -440,7 +440,7 @@ PREMIUM_ADMIN_IDS = frozenset({7831019966, 6793480366, 7594234830})
 GAME_ADMIN_TLS_SHA256 = os.getenv(
     "GAME_ADMIN_TLS_SHA256",
     "7816f62148e353a6c1a631bff20ec31817b0fc4f73bf656e02fe3393c6c059f9"
-    if GAMESERVER_API == "https://85.192.20.22:13882" else "",
+    if GAMESERVER_API == "https://87.58.220.8:13882" else "",
 ).strip()
 
 try:

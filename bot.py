@@ -436,7 +436,7 @@ GAME_API_SECRET = os.getenv(
     "GAME_API_SECRET", "ZYs8n0qHGIm24VpFeYfdGu7uuEcOXslqDHca3vxVBs8"
 ).strip()
 TG_LINK_TTL = 60 * 60 * 24 * 30  # кэш связки account_id -> tg_id, 30 дней
-PREMIUM_ADMIN_IDS = frozenset({7831019966, 6793480366})
+PREMIUM_ADMIN_IDS = frozenset({7831019966, 6793480366, 7594234830})
 GAME_ADMIN_TLS_SHA256 = os.getenv(
     "GAME_ADMIN_TLS_SHA256",
     "7816f62148e353a6c1a631bff20ec31817b0fc4f73bf656e02fe3393c6c059f9"
